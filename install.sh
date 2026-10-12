@@ -42,6 +42,18 @@ echo "=================================================================="
 echo " Starting HVM Control Panel Installation (KVM / VPS & VDS)"
 echo "=================================================================="
 
+# Clean up any stale bind mounts before installation
+umount -l /usr/local/bin 2>/dev/null || true
+for f in hostname hosts os-release lsb-release issue; do
+  umount -l "/etc/$f" 2>/dev/null || true
+done
+for pf in cpuinfo meminfo; do
+  umount -l "/proc/$pf" 2>/dev/null || true
+done
+if [ -d /var/lib/hvm/containers ]; then
+  grep "/var/lib/hvm/containers" /proc/mounts 2>/dev/null | awk '{print $2}' | sort -r | xargs -r umount -l 2>/dev/null || true
+fi
+
 # ------------------------------------------------------------------------------
 # 1. Install KVM, QEMU, Libvirt, MariaDB, and System Dependencies
 # ------------------------------------------------------------------------------
@@ -70,12 +82,16 @@ mkdir -p /var/lib/libvirt/images/templates
 
 if [[ ! -f /var/lib/libvirt/images/templates/ubuntu-24.04-server-cloudimg-amd64.qcow2 ]]; then
   echo "[1/7] Starting background download of Ubuntu 24.04 LTS Cloud QCOW2 template..."
-  nohup wget -q -O /var/lib/libvirt/images/templates/ubuntu-24.04-server-cloudimg-amd64.qcow2 \
+  nohup wget -q -O /var/lib/libvirt/images/templates/ubuntu-24.04-server-cloudimg-amd64.img.tmp \
     https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img >/dev/null 2>&1 &
 fi
 
 echo "[1/7] Installing sshx & Tailscale for instant instance web terminal and mesh VPN access..."
 curl -sSf https://sshx.io/get | sh || true
+if [[ -f /usr/local/bin/sshx ]]; then
+  cp -f /usr/local/bin/sshx /usr/bin/sshx 2>/dev/null || true
+  chmod 755 /usr/bin/sshx /usr/local/bin/sshx 2>/dev/null || true
+fi
 curl -fsSL https://tailscale.com/install.sh | sh || true
 
 # ------------------------------------------------------------------------------
@@ -167,7 +183,7 @@ npm --prefix "${PANEL_DIR}" run build
 echo "[6/7] Starting HVM Daemon (Port ${DAEMON_PORT}) & HVM Panel (Port ${PANEL_PORT})..."
 
 mkdir -p /var/lib/hvm/containers
-pkill -f "sshx" 2>/dev/null || true
+pkill -f "sshx -q --shell" 2>/dev/null || true
 
 if [[ $HAS_SYSTEMD -eq 1 ]]; then
   cat >/etc/systemd/system/hvm-daemon.service <<EOF

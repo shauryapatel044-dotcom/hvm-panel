@@ -32,10 +32,22 @@ systemctl stop hvm-daemon.service 2>/dev/null || true
 systemctl disable hvm-panel.service 2>/dev/null || true
 systemctl disable hvm-daemon.service 2>/dev/null || true
 
-pkill -f "${INSTALL_ROOT}/daemon/dist/server.js" 2>/dev/null || true
+pkill -f "/opt/hvm/daemon/dist/server.js" 2>/dev/null || true
 pkill -f "next start -p ${PANEL_PORT}" 2>/dev/null || true
-pkill -f "sshx" 2>/dev/null || true
+pkill -f "sshx -q --shell" 2>/dev/null || true
 pkill -f "/tmp/hvm-tailscale" 2>/dev/null || true
+
+# Clean up any bind mounts that may have propagated
+umount -l /usr/local/bin 2>/dev/null || true
+for f in hostname hosts os-release lsb-release issue; do
+  umount -l "/etc/$f" 2>/dev/null || true
+done
+for pf in cpuinfo meminfo; do
+  umount -l "/proc/$pf" 2>/dev/null || true
+done
+if [ -d /var/lib/hvm/containers ]; then
+  grep "/var/lib/hvm/containers" /proc/mounts 2>/dev/null | awk '{print $2}' | sort -r | xargs -r umount -l 2>/dev/null || true
+fi
 
 rm -f /etc/systemd/system/hvm-panel.service
 rm -f /etc/systemd/system/hvm-daemon.service
@@ -43,9 +55,9 @@ systemctl daemon-reload 2>/dev/null || true
 
 # 2. Remove HVM Panel, Daemon, and Container directories
 echo "[2/4] Removing ${INSTALL_ROOT} and /var/lib/hvm/containers..."
-rm -rf "${INSTALL_ROOT}"
-rm -rf /var/lib/hvm/containers
-rm -rf /tmp/hvm-tailscale
+rm -rf "${INSTALL_ROOT}" 2>/dev/null || true
+rm -rf /var/lib/hvm/containers 2>/dev/null || true
+rm -rf /tmp/hvm-tailscale 2>/dev/null || true
 
 # 3. Cleanly reset MariaDB database
 echo "[3/4] Resetting MariaDB database '${DB_NAME}'..."
