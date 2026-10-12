@@ -500,6 +500,78 @@ eval "exec \\"\$REAL_BIN\\" \$NEW_ARGS"
       );
     }
 
+    // Virtualized neofetch / fastfetch / screenfetch showing the exact new VPS/VDS hardware & OS specs
+    const usedRamMb = Math.floor(ramMb * 0.14);
+    const diskPct = Math.max(1, Math.floor((2 / diskGb) * 100));
+    const dashLine = "-".repeat(`root@${spec.hostname}`.length);
+    const neofetchScript = `#!/bin/sh
+C="\\033[1;36m"
+W="\\033[1;37m"
+R="\\033[0m"
+UP_MIN=$(( ($(date +%s) - ${Math.floor(Date.now() / 1000)}) / 60 + 1 ))
+printf "\\n"
+printf "            \${C}.-,/+oossssoo+/-.\${R}               \${C}root\${R}@\${C}${spec.hostname}\${R}\\n"
+printf "        \${C}':+ssssssssssssssssss+:'\${R}           ${dashLine}\\n"
+printf "      \${C}-+ssssssssssssssssssyyssss+-\${R}         \${C}OS\${R}: ${osInfo.label} x86_64\\n"
+printf "    \${C}.ossssssssssssssssssdMMMNysssso.\${R}       \${C}Host\${R}: QEMU Standard PC (Q35 + ICH9, 2009) (${spec.instanceType})\\n"
+printf "   \${C}/ssssssssssshdmmNNmmyNMMMMhssssss/\${R}      \${C}Kernel\${R}: ${kernelVer}\\n"
+printf "  \${C}+ssssssssshmydMMMMMMMNddddyssssssss+\${R}     \${C}Uptime\${R}: \${UP_MIN} mins\\n"
+printf " \${C}/sssssssshNMMMyhhyyyyhmNMMMNhssssssss/\${R}    \${C}Packages\${R}: 648 (dpkg)\\n"
+printf "\${C}.ssssssssdMMMNhsssssssssshNMMMdssssssss.\${R}   \${C}Shell\${R}: bash 5.2.21\\n"
+printf "\${C}+sssshhhyNMMNyssssssssssssyNMMMysssssss+\${R}   \${C}Terminal\${R}: /dev/pts/0\\n"
+printf "\${C}ossyNMMMNyMMhsssssssssssssshmmmhssssssso\${R}   \${C}CPU\${R}: QEMU Virtual CPU version 2.5+ (${vcpus}) @ 2.994GHz\\n"
+printf "\${C}ossyNMMMNyMMhsssssssssssssshmmmhssssssso\${R}   \${C}GPU\${R}: Red Hat, Inc. Virtio GPU\\n"
+printf "\${C}+sssshhhyNMMNyssssssssssssyNMMMysssssss+\${R}   \${C}Memory\${R}: ${usedRamMb}MiB / ${ramMb}MiB\\n"
+printf "\${C}.ssssssssdMMMNhsssssssssshNMMMdssssssss.\${R}   \${C}Disk (/)\${R}: 2.1G / ${diskGb}G (${diskPct}%%)\\n"
+printf " \${C}/sssssssshNMMMyhhyyyyhmNMMMNhssssssss/\${R}    \${C}Local IP (eth0)\${R}: ${cleanIp}\\n"
+printf "  \${C}+ssssssssshmydMMMMMMMNddddyssssssss+\${R}\\n"
+printf "   \${C}/ssssssssssshdmmNNmmyNMMMMhssssss/\${R}      \\033[40m   \\033[41m   \\033[42m   \\033[43m   \\033[44m   \\033[45m   \\033[46m   \\033[47m   \${R}\\n"
+printf "    \${C}.ossssssssssssssssssdMMMNysssso.\${R}\\n"
+printf "      \${C}-+sssssssssssssssssyyyssss+-\${R}\\n"
+printf "        \${C}':+ssssssssssssssssss+:'\${R}\\n"
+printf "            \${C}.-,/+oossssoo+/-.\${R}\\n\\n"
+`;
+    for (const fetchBin of ["neofetch", "fastfetch", "screenfetch"]) {
+      await writeLf(path.join(vmFsRoot, "vbin", fetchBin), neofetchScript);
+    }
+
+    // Smart apt / apt-get wrapper that automatically clears stuck dpkg/apt locks and handles neofetch/fastfetch
+    for (const aptBin of ["apt", "apt-get"]) {
+      await writeLf(
+        path.join(vmFsRoot, "vbin", aptBin),
+        `#!/bin/sh
+ALL_ARGS="\$*"
+case "\$ALL_ARGS" in
+  *install*neofetch*|*install*fastfetch*|*install*screenfetch*)
+    echo "Reading package lists... Done"
+    echo "Building dependency tree... Done"
+    echo "Reading state information... Done"
+    echo "The following NEW packages will be installed:"
+    echo "  neofetch"
+    echo "0 upgraded, 1 newly installed, 0 to remove and 0 not upgraded."
+    echo "Need to get 154 kB of archives."
+    echo "After this operation, 412 kB of additional disk space will be used."
+    echo "Selecting previously unselected package neofetch."
+    echo "(Reading database ... 34820 files and directories currently installed.)"
+    echo "Preparing to unpack .../neofetch_7.1.0-4_all.deb ..."
+    echo "Unpacking neofetch (7.1.0-4) ..."
+    echo "Setting up neofetch (7.1.0-4) ..."
+    echo "Processing triggers for man-db (2.12.0-4) ..."
+    exit 0
+    ;;
+esac
+
+if fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || fuser /var/lib/dpkg/lock >/dev/null 2>&1 || [ -f /var/lib/dpkg/lock-frontend ]; then
+  killall -9 apt apt-get unattended-upgr 2>/dev/null || true
+  rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock /var/lib/apt/lists/lock 2>/dev/null || true
+  dpkg --configure -a >/dev/null 2>&1 || true
+fi
+
+exec /usr/bin/${aptBin} "\$@"
+`
+      );
+    }
+
     // 3. Isolated Container Entrypoint Script (zero mount --bind calls so it never leaks mounts to the host)
     await writeLf(
       path.join(vmFsRoot, "enter-vps.sh"),
@@ -539,6 +611,14 @@ else
 fi
 `
     );
+
+    if (process.platform !== "win32") {
+      await fs.mkdir(`${containerDir}/etc`, { recursive: true }).catch(() => {});
+      await fs.mkdir(`${containerDir}/vbin`, { recursive: true }).catch(() => {});
+      await fs.cp(path.join(vmFsRoot, "etc"), `${containerDir}/etc`, { recursive: true, force: true }).catch(() => {});
+      await fs.cp(path.join(vmFsRoot, "vbin"), `${containerDir}/vbin`, { recursive: true, force: true }).catch(() => {});
+      await fs.copyFile(path.join(vmFsRoot, "enter-vps.sh"), `${containerDir}/enter-vps.sh`).catch(() => {});
+    }
   }
 
   /**

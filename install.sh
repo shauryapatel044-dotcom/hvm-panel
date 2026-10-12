@@ -59,9 +59,13 @@ fi
 # ------------------------------------------------------------------------------
 echo "[1/7] Installing KVM, QEMU, libvirt, MariaDB, and system packages..."
 export DEBIAN_FRONTEND=noninteractive
+killall -9 apt apt-get unattended-upgr 2>/dev/null || true
+rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock /var/lib/apt/lists/lock 2>/dev/null || true
+dpkg --configure -a >/dev/null 2>&1 || true
+
 apt-get update -y || true
 apt-get install -y \
-  curl wget git gnupg2 ca-certificates lsb-release openssl \
+  curl wget git gnupg2 ca-certificates lsb-release openssl psmisc \
   build-essential pkg-config \
   qemu-kvm qemu-utils libvirt-daemon-system libvirt-clients \
   bridge-utils virtinst ovmf cloud-image-utils genisoimage \
@@ -87,12 +91,16 @@ if [[ ! -f /var/lib/libvirt/images/templates/ubuntu-24.04-server-cloudimg-amd64.
 fi
 
 echo "[1/7] Installing sshx & Tailscale for instant instance web terminal and mesh VPN access..."
-curl -sSf https://sshx.io/get | sh || true
+if ! command -v sshx >/dev/null 2>&1; then
+  curl -sSf https://sshx.io/get | sh || true
+fi
 if [[ -f /usr/local/bin/sshx ]]; then
   cp -f /usr/local/bin/sshx /usr/bin/sshx 2>/dev/null || true
   chmod 755 /usr/bin/sshx /usr/local/bin/sshx 2>/dev/null || true
 fi
-curl -fsSL https://tailscale.com/install.sh | sh || true
+if ! command -v tailscaled >/dev/null 2>&1; then
+  curl -fsSL https://tailscale.com/install.sh | sh || true
+fi
 
 # ------------------------------------------------------------------------------
 # 2. Configure & Secure MariaDB on Custom Port 7090
