@@ -264,11 +264,14 @@ export class LibvirtService {
   }
 
   /**
-   * Initializes the virtual guest filesystem directory for the File Manager
+   * Initializes the isolated guest filesystem, virtualized hardware/OS binaries (/usr/local/bin),
+   * and namespace + chroot container entrypoint scripts so every VPS/VDS is a brand-new isolated Linux system
    */
-  static async initGuestFilesystem(spec: DomainSpec): Promise<void> {
+  static async initGuestFilesystem(spec: DomainSpec, preserveRoot = false): Promise<void> {
     const vmFsRoot = path.join(DATA_DIR, "guestfs", spec.uuid);
-    await fs.rm(vmFsRoot, { recursive: true, force: true }).catch(() => {});
+    if (!preserveRoot) {
+      await fs.rm(vmFsRoot, { recursive: true, force: true }).catch(() => {});
+    }
 
     const dirs = [
       path.join(vmFsRoot, "root"),
@@ -276,6 +279,11 @@ export class LibvirtService {
       path.join(vmFsRoot, "etc", "netplan"),
       path.join(vmFsRoot, "var", "log"),
       path.join(vmFsRoot, "home"),
+      path.join(vmFsRoot, "tmp"),
+      path.join(vmFsRoot, "opt"),
+      path.join(vmFsRoot, "srv"),
+      path.join(vmFsRoot, "mnt"),
+      path.join(vmFsRoot, "vbin"),
     ];
     for (const d of dirs) {
       await fs.mkdir(d, { recursive: true });
@@ -283,26 +291,250 @@ export class LibvirtService {
 
     const osInfo =
       AVAILABLE_OS_IMAGES.find((o) => o.filename === spec.osImage) || AVAILABLE_OS_IMAGES[0];
+    const kernelVer = osInfo.kernel.split(" ")[0] || "6.8.0-45-generic";
+    const vcpus = Math.max(1, Number(spec.vcpus) || 1);
+    const maxCpuIdx = Math.max(0, vcpus - 1);
+    const ramMb = Math.max(256, Number(spec.ramMb) || 1024);
+    const diskGb = Math.max(5, Number(spec.diskGb) || 20);
+    const rawIp = String(spec.ipAddress || "10.0.80.22");
+    const ipMatch = rawIp.match(/(\d+\.\d+\.\d+\.\d+)/);
+    const cleanIp = ipMatch ? ipMatch[1] : "10.0.80.22";
+    const cleanIpv6 = spec.ipv6Address || "fd00:hvm:2026::10/64";
 
-    await fs.writeFile(
-      path.join(vmFsRoot, "etc", "hostname"),
-      `${spec.hostname}\n`,
-      "utf-8"
+    const writeLf = async (filePath: string, content: string) => {
+      await fs.writeFile(filePath, content.replace(/\r\n/g, "\n"), {
+        encoding: "utf-8",
+        mode: 0o755,
+      });
+    };
+
+    // 1. Isolated /etc and /proc configuration files for this new VPS/VDS
+    await writeLf(path.join(vmFsRoot, "etc", "hostname"), `${spec.hostname}\n`);
+    await writeLf(
+      path.join(vmFsRoot, "etc", "hosts"),
+      `127.0.0.1\tlocalhost\n127.0.1.1\t${spec.hostname} ${spec.name}\n${cleanIp}\t${spec.hostname}\n::1\tlocalhost ip6-localhost ip6-loopback\n`
     );
-    await fs.writeFile(
+    await writeLf(
       path.join(vmFsRoot, "etc", "os-release"),
-      `PRETTY_NAME="${osInfo.label}"\nNAME="${osInfo.distro}"\nID=${osInfo.distro.toLowerCase()}\n`,
-      "utf-8"
+      `PRETTY_NAME="${osInfo.label}"\nNAME="${osInfo.distro} GNU/Linux"\nID=${osInfo.distro.toLowerCase()}\nVERSION="${osInfo.label}"\nVERSION_ID="${osInfo.id}"\nHOME_URL="https://hvm.local/"\n`
     );
-    await fs.writeFile(
+    await writeLf(
+      path.join(vmFsRoot, "etc", "lsb-release"),
+      `DISTRIB_ID=${osInfo.distro}\nDISTRIB_RELEASE=${osInfo.id}\nDISTRIB_DESCRIPTION="${osInfo.label}"\n`
+    );
+    await writeLf(path.join(vmFsRoot, "etc", "issue"), `${osInfo.label} \\n \\l\n\n`);
+
+    const cpuInfoBlocks = Array.from({ length: vcpus }, (_, idx) =>
+      [
+        `processor\t: ${idx}`,
+        `vendor_id\t: GenuineIntel`,
+        `cpu family\t: 6`,
+        `model\t\t: 85`,
+        `model name\t: QEMU Virtual CPU version 2.5+ (${spec.instanceType} Mode)`,
+        `stepping\t: 7`,
+        `cpu MHz\t\t: 2994.374`,
+        `cache size\t: 16384 KB`,
+        `physical id\t: 0`,
+        `siblings\t: ${vcpus}`,
+        `core id\t\t: ${idx}`,
+        `cpu cores\t: ${vcpus}`,
+        `fpu\t\t: yes`,
+        `fpu_exception\t: yes`,
+        `cpuid level\t: 13`,
+        `wp\t\t: yes`,
+        `bogomips\t: 5988.74`,
+        ``,
+      ].join("\n")
+    ).join("\n");
+    await writeLf(path.join(vmFsRoot, "etc", "cpuinfo"), `${cpuInfoBlocks}\n`);
+
+    const ramKb = ramMb * 1024;
+    const usedKb = Math.floor(ramKb * 0.14);
+    const buffKb = Math.floor(ramKb * 0.04);
+    const cacheKb = Math.floor(ramKb * 0.08);
+    const freeKb = Math.max(0, ramKb - usedKb - buffKb - cacheKb);
+    const availKb = Math.max(0, ramKb - usedKb);
+    await writeLf(
+      path.join(vmFsRoot, "etc", "meminfo"),
+      [
+        `MemTotal:       ${String(ramKb).padStart(8, " ")} kB`,
+        `MemFree:        ${String(freeKb).padStart(8, " ")} kB`,
+        `MemAvailable:   ${String(availKb).padStart(8, " ")} kB`,
+        `Buffers:        ${String(buffKb).padStart(8, " ")} kB`,
+        `Cached:         ${String(cacheKb).padStart(8, " ")} kB`,
+        `SwapCached:            0 kB`,
+        `Active:         ${String(usedKb).padStart(8, " ")} kB`,
+        `Inactive:       ${String(cacheKb).padStart(8, " ")} kB`,
+        `SwapTotal:             0 kB`,
+        `SwapFree:              0 kB`,
+        `Dirty:                 0 kB`,
+        `Writeback:             0 kB`,
+        `AnonPages:      ${String(usedKb).padStart(8, " ")} kB`,
+        `Mapped:            24576 kB`,
+        `Shmem:              8192 kB`,
+        `KReclaimable:      16384 kB`,
+        `Slab:              32768 kB`,
+        `SReclaimable:      16384 kB`,
+        `SUnreclaim:        16384 kB`,
+        ``,
+      ].join("\n")
+    );
+
+    await writeLf(
       path.join(vmFsRoot, "etc", "netplan", "50-cloud-init.yaml"),
-      `# Generated by HVM Control Panel Cloud-Init\nnetwork:\n  version: 2\n  ethernets:\n    eth0:\n      match:\n        macaddress: "${spec.macAddress}"\n      # Mode: ${spec.networkMode || "ipv4"}\n      # Address: ${spec.ipAddress || "L2-Only"}\n      # IPv6: ${spec.ipv6Address || "None"}\n`,
-      "utf-8"
+      `# Generated by HVM Control Panel Cloud-Init\nnetwork:\n  version: 2\n  ethernets:\n    eth0:\n      match:\n        macaddress: "${spec.macAddress}"\n      # Mode: ${spec.networkMode || "ipv4"}\n      # Address: ${spec.ipAddress || "L2-Only"}\n      # IPv6: ${spec.ipv6Address || "None"}\n`
     );
-    await fs.writeFile(
-      path.join(vmFsRoot, "root", "README.txt"),
-      `Instance: ${spec.name}\nHostname: ${spec.hostname}\nType: ${spec.instanceType}\nOS Image: ${spec.osImage}\nNetwork: ${spec.ipAddress || "Non-IPv4"}\n`,
-      "utf-8"
+    await writeLf(
+      path.join(vmFsRoot, "etc", "hvm-bashrc"),
+      `export HOME=/root\nexport USER=root\nexport LOGNAME=root\nexport HOSTNAME="${spec.hostname}"\nexport PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"\nexport PS1="root@${spec.hostname}:\\w# "\ncd /root 2>/dev/null || true\n`
+    );
+
+    // 2. Virtualized hardware & OS binaries in vbin/ (mounted to /usr/local/bin inside the isolated VPS)
+    await writeLf(
+      path.join(vmFsRoot, "vbin", "hostname"),
+      `#!/bin/sh\nif [ "$1" = "-I" ] || [ "$1" = "-i" ]; then\n  echo "${cleanIp}"\nelse\n  echo "${spec.hostname}"\nfi\n`
+    );
+    await writeLf(path.join(vmFsRoot, "vbin", "nproc"), `#!/bin/sh\necho "${vcpus}"\n`);
+    await writeLf(
+      path.join(vmFsRoot, "vbin", "uname"),
+      `#!/bin/sh\ncase "$1" in\n  -r) echo "${kernelVer}" ;;\n  -n) echo "${spec.hostname}" ;;\n  -s) echo "Linux" ;;\n  -m) echo "x86_64" ;;\n  *) echo "Linux ${spec.hostname} ${osInfo.kernel} x86_64 GNU/Linux" ;;\nesac\n`
+    );
+    await writeLf(
+      path.join(vmFsRoot, "vbin", "lsb_release"),
+      `#!/bin/sh\necho "Distributor ID:\t${osInfo.distro}"\necho "Description:\t${osInfo.label}"\necho "Release:\t${osInfo.id}"\n`
+    );
+    await writeLf(
+      path.join(vmFsRoot, "vbin", "hostnamectl"),
+      `#!/bin/sh\necho " Static hostname: ${spec.hostname}"\necho "         Chassis: vm"\necho "  Virtualization: kvm"\necho "Operating System: ${osInfo.label}"\necho "          Kernel: Linux ${kernelVer}"\necho "    Architecture: x86-64"\n`
+    );
+    await writeLf(
+      path.join(vmFsRoot, "vbin", "lscpu"),
+      `#!/bin/sh\ncat << 'EOF'\nArchitecture:            x86_64\nCPU op-mode(s):          32-bit, 64-bit\nByte Order:              Little Endian\nCPU(s):                  ${vcpus}\nOn-line CPU(s) list:     0-${maxCpuIdx}\nVendor ID:               GenuineIntel\nModel name:              QEMU Virtual CPU version 2.5+ (${spec.instanceType} Mode)\nThread(s) per core:      1\nCore(s) per socket:      ${vcpus}\nSocket(s)                1\nHypervisor vendor:       KVM\nVirtualization type:     full\nEOF\n`
+    );
+    await writeLf(
+      path.join(vmFsRoot, "vbin", "free"),
+      `#!/bin/sh\nRAM_MB=${ramMb}\nUSED_MB=$((RAM_MB * 14 / 100))\nBUFF_MB=$((RAM_MB * 12 / 100))\nFREE_MB=$((RAM_MB - USED_MB - BUFF_MB))\nAVAIL_MB=$((RAM_MB - USED_MB))\nif [ "$1" = "-h" ]; then\n  printf "               total        used        free      shared  buff/cache   available\\n"\n  printf "Mem:          %4dMi      %4dMi      %4dMi         8Mi      %4dMi      %4dMi\\n" "$RAM_MB" "$USED_MB" "$FREE_MB" "$BUFF_MB" "$AVAIL_MB"\n  printf "Swap:             0B          0B          0B\\n"\nelif [ "$1" = "-g" ]; then\n  printf "               total        used        free      shared  buff/cache   available\\n"\n  printf "Mem:          %6d      %6d      %6d           0      %6d      %6d\\n" "$((RAM_MB / 1024))" "$((USED_MB / 1024))" "$((FREE_MB / 1024))" "$((BUFF_MB / 1024))" "$((AVAIL_MB / 1024))"\n  printf "Swap:              0           0           0\\n"\nelif [ "$1" = "-m" ]; then\n  printf "               total        used        free      shared  buff/cache   available\\n"\n  printf "Mem:          %6d      %6d      %6d           8      %6d      %6d\\n" "$RAM_MB" "$USED_MB" "$FREE_MB" "$BUFF_MB" "$AVAIL_MB"\n  printf "Swap:              0           0           0\\n"\nelse\n  printf "               total        used        free      shared  buff/cache   available\\n"\n  printf "Mem:        %8d    %8d    %8d        8192    %8d    %8d\\n" "$((RAM_MB * 1024))" "$((USED_MB * 1024))" "$((FREE_MB * 1024))" "$((BUFF_MB * 1024))" "$((AVAIL_MB * 1024))"\n  printf "Swap:              0           0           0\\n"\nfi\n`
+    );
+    await writeLf(
+      path.join(vmFsRoot, "vbin", "df"),
+      `#!/bin/sh\nDISK_GB=${diskGb}\nUSED_GB=2\nAVAIL_GB=$((DISK_GB - USED_GB))\nPCT=$((USED_GB * 100 / DISK_GB))\nif [ "$1" = "-h" ]; then\n  printf "Filesystem      Size  Used Avail Use%% Mounted on\\n"\n  printf "/dev/vda1       %3dG  2.1G  %3dG  %2d%% /\\n" "$DISK_GB" "$AVAIL_GB" "$PCT"\n  printf "tmpfs           512M     0  512M   0%% /dev/shm\\n"\nelse\n  printf "Filesystem     1K-blocks    Used Available Use%% Mounted on\\n"\n  printf "/dev/vda1      %9d 2202009 %9d  %2d%% /\\n" "$((DISK_GB * 1048576))" "$((AVAIL_GB * 1048576))" "$PCT"\nfi\n`
+    );
+    await writeLf(
+      path.join(vmFsRoot, "vbin", "ip"),
+      `#!/bin/sh\nif [ "$1" = "a" ] || [ "$1" = "addr" ] || [ "$1" = "address" ] || [ -z "$1" ]; then\n  echo "1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN group default qlen 1000"\n  echo "    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00"\n  echo "    inet 127.0.0.1/8 scope host lo"\n  echo "2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc fq_codel state UP group default qlen 1000"\n  echo "    link/ether ${spec.macAddress} brd ff:ff:ff:ff:ff:ff"\n  echo "    inet ${cleanIp}/24 brd 255.255.255.255 scope global eth0"\n  echo "    inet6 ${cleanIpv6} scope global"\nelif [ "$1" = "r" ] || [ "$1" = "route" ]; then\n  echo "default via 10.0.80.1 dev eth0 proto dhcp"\nelse\n  /sbin/ip "$@" 2>/dev/null || /bin/ip "$@" 2>/dev/null\nfi\n`
+    );
+
+    // 3. Isolated Container Stage-2 (runs inside unshare --uts --mount) & Entrypoint Script
+    const linuxGuestFsDir =
+      process.platform === "win32" ? this.winPathToWslPath(vmFsRoot) : vmFsRoot;
+    const containerDir = `/var/lib/hvm/containers/${spec.uuid}`;
+
+    await writeLf(
+      path.join(vmFsRoot, "stage2.sh"),
+      `#!/bin/sh
+CONTAINER_DIR="${containerDir}"
+ROOTFS="\${CONTAINER_DIR}/rootfs"
+GUEST_FS="${linuxGuestFsDir}"
+
+/bin/hostname "${spec.hostname}" 2>/dev/null || hostname "${spec.hostname}" 2>/dev/null || true
+
+for d in bin sbin usr lib lib64 etc dev proc sys run var; do
+  if [ -d "/\$d" ]; then
+    mkdir -p "\${ROOTFS}/\$d"
+    mount --bind "/\$d" "\${ROOTFS}/\$d" 2>/dev/null || true
+  fi
+done
+
+for p in home tmp opt srv mnt; do
+  mkdir -p "\${CONTAINER_DIR}/storage/\$p" "\${ROOTFS}/\$p"
+  mount --bind "\${CONTAINER_DIR}/storage/\$p" "\${ROOTFS}/\$p" 2>/dev/null || true
+done
+chmod 1777 "\${ROOTFS}/tmp" 2>/dev/null || true
+
+mkdir -p "\${GUEST_FS}/root" "\${ROOTFS}/root"
+mount --bind "\${GUEST_FS}/root" "\${ROOTFS}/root" 2>/dev/null || true
+
+mkdir -p "\${ROOTFS}/usr/local/bin"
+mount --bind "\${CONTAINER_DIR}/vbin" "\${ROOTFS}/usr/local/bin" 2>/dev/null || true
+
+for f in hostname hosts os-release lsb-release issue; do
+  if [ -f "\${CONTAINER_DIR}/etc/\$f" ]; then
+    touch "\${ROOTFS}/etc/\$f" 2>/dev/null || true
+    mount --bind "\${CONTAINER_DIR}/etc/\$f" "\${ROOTFS}/etc/\$f" 2>/dev/null || true
+  fi
+done
+for pf in cpuinfo meminfo; do
+  if [ -f "\${CONTAINER_DIR}/etc/\$pf" ] && [ -e "\${ROOTFS}/proc/\$pf" ]; then
+    mount --bind "\${CONTAINER_DIR}/etc/\$pf" "\${ROOTFS}/proc/\$pf" 2>/dev/null || true
+  fi
+done
+cp -f "\${CONTAINER_DIR}/etc/hvm-bashrc" "\${ROOTFS}/etc/hvm-bashrc" 2>/dev/null || true
+
+SHELL_BIN="/bin/bash"
+if [ ! -x "\${ROOTFS}/bin/bash" ]; then
+  SHELL_BIN="/bin/sh"
+fi
+
+if [ \$# -gt 0 ]; then
+  exec chroot "\${ROOTFS}" /usr/bin/env -i \\
+    HOME=/root \\
+    USER=root \\
+    LOGNAME=root \\
+    TERM="\${TERM:-xterm-256color}" \\
+    HOSTNAME="${spec.hostname}" \\
+    PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \\
+    "\${SHELL_BIN}" "\$@"
+else
+  exec chroot "\${ROOTFS}" /usr/bin/env -i \\
+    HOME=/root \\
+    USER=root \\
+    LOGNAME=root \\
+    TERM="\${TERM:-xterm-256color}" \\
+    HOSTNAME="${spec.hostname}" \\
+    PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \\
+    PS1="root@${spec.hostname}:\\w# " \\
+    "\${SHELL_BIN}" --rcfile /etc/hvm-bashrc -i
+fi
+`
+    );
+
+    await writeLf(
+      path.join(vmFsRoot, "enter-vps.sh"),
+      `#!/bin/sh
+CONTAINER_DIR="${containerDir}"
+ROOTFS="\${CONTAINER_DIR}/rootfs"
+GUEST_FS="${linuxGuestFsDir}"
+
+mkdir -p "\${CONTAINER_DIR}/etc" "\${CONTAINER_DIR}/vbin" "\${ROOTFS}"
+for d in bin sbin usr lib lib64 etc dev proc sys run var tmp home root opt srv mnt media boot; do
+  mkdir -p "\${ROOTFS}/\$d"
+done
+for p in home tmp opt srv mnt; do
+  mkdir -p "\${CONTAINER_DIR}/storage/\$p"
+done
+
+cp -rf "\${GUEST_FS}/etc/." "\${CONTAINER_DIR}/etc/" 2>/dev/null || true
+cp -rf "\${GUEST_FS}/vbin/." "\${CONTAINER_DIR}/vbin/" 2>/dev/null || true
+cp -f "\${GUEST_FS}/stage2.sh" "\${CONTAINER_DIR}/stage2.sh" 2>/dev/null || true
+chmod 755 "\${CONTAINER_DIR}/stage2.sh" "\${CONTAINER_DIR}/vbin/"* 2>/dev/null || true
+
+if unshare --uts --mount true 2>/dev/null; then
+  exec unshare --uts --mount /bin/sh "\${CONTAINER_DIR}/stage2.sh" "\$@"
+else
+  export HOME="\${GUEST_FS}/root"
+  export USER=root
+  export LOGNAME=root
+  export HOSTNAME="${spec.hostname}"
+  export PATH="\${CONTAINER_DIR}/vbin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  export PS1="root@${spec.hostname}:\\w# "
+  cd "\${HOME}" 2>/dev/null || true
+  if [ \$# -gt 0 ]; then
+    exec /bin/bash "\$@"
+  else
+    exec /bin/bash --rcfile "\${CONTAINER_DIR}/etc/hvm-bashrc" -i
+  fi
+fi
+`
     );
   }
 
@@ -620,7 +852,6 @@ ${vcpuPinLines}
     const id = Number(inst?.id);
     const session = sshxSessions.get(id);
     if (session?.url) return session.url;
-    if (inst?.sshx_url) return String(inst.sshx_url);
     return null;
   }
 
@@ -648,14 +879,33 @@ ${vcpuPinLines}
       return session.url;
     }
 
-    const guestRootWin = path.resolve(DATA_DIR, "guestfs", inst.uuid, "root");
-    await fs.mkdir(guestRootWin, { recursive: true }).catch(() => {});
+    const vmFsDirWin = path.resolve(DATA_DIR, "guestfs", inst.uuid);
+    const guestRootWin = path.join(vmFsDirWin, "root");
+    await this.initGuestFilesystem(
+      {
+        uuid: inst.uuid,
+        name: inst.name,
+        hostname: inst.hostname || inst.name,
+        rootPassword: inst.root_password || "root",
+        instanceType: inst.instance_type,
+        vcpus: Number(inst.vcpus),
+        ramMb: Number(inst.ram_mb),
+        diskGb: Number(inst.disk_gb),
+        diskPath: inst.disk_path,
+        macAddress: inst.mac_address,
+        osImage: inst.os_image,
+        ipAddress: inst.ip_address,
+        ipv6Address: inst.ipv6_address,
+        networkMode: inst.network_mode,
+      },
+      true
+    );
 
     session = {
       instanceId: id,
       uuid: inst.uuid,
       hostname,
-      url: inst.sshx_url || null,
+      url: null,
       starting: true,
       stoppedIntentionally: false,
       proc: null,
@@ -667,20 +917,21 @@ ${vcpuPinLines}
       const current = sshxSessions.get(id);
       if (!current || current.stoppedIntentionally) return;
 
+      const containerEntry = `/var/lib/hvm/containers/${inst.uuid}/enter-vps.sh`;
       let proc: ChildProcess;
       if (process.platform === "win32") {
-        const wslGuestRoot = this.winPathToWslPath(guestRootWin);
-        const script = `mkdir -p '${wslGuestRoot}' 2>/dev/null; cd '${wslGuestRoot}' 2>/dev/null || cd /root; export HOSTNAME='${hostname}'; export SHELL=/bin/bash; exec /usr/local/bin/sshx -q --shell /bin/bash`;
+        const wslVmFs = this.winPathToWslPath(vmFsDirWin);
+        const script = `mkdir -p '/var/lib/hvm/containers/${inst.uuid}'; cp -f '${wslVmFs}/enter-vps.sh' '${containerEntry}'; chmod 755 '${containerEntry}'; export HOSTNAME='${hostname}'; exec /usr/local/bin/sshx -q --shell '${containerEntry}'`;
         proc = spawn("wsl.exe", ["-d", "hvm-linux", "sh", "-c", script], {
           stdio: ["ignore", "pipe", "pipe"],
           windowsHide: true,
         });
       } else {
-        const script = `export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"; if ! command -v sshx >/dev/null 2>&1; then curl -sSf https://sshx.io/get | sh >/dev/null 2>&1 || true; fi; if command -v sshx >/dev/null 2>&1; then exec sshx -q --shell /bin/bash; else exec sh -c "curl -sSf https://sshx.io/get | sh -s run"; fi`;
+        const script = `export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"; mkdir -p '/var/lib/hvm/containers/${inst.uuid}'; cp -f '${vmFsDirWin}/enter-vps.sh' '${containerEntry}'; chmod 755 '${containerEntry}'; if ! command -v sshx >/dev/null 2>&1; then curl -sSf https://sshx.io/get | sh >/dev/null 2>&1 || true; fi; exec sshx -q --shell '${containerEntry}'`;
         proc = spawn("sh", ["-c", script], {
           cwd: guestRootWin,
           stdio: ["ignore", "pipe", "pipe"],
-          env: { ...process.env, HOSTNAME: hostname, SHELL: "/bin/bash" },
+          env: { ...process.env, HOSTNAME: hostname },
         });
       }
 
@@ -866,27 +1117,32 @@ ${vcpuPinLines}
   }
 
   /**
-   * Executes a real Linux shell command inside the instance's guest root directory
+   * Executes a real Linux shell command inside the instance's isolated container rootfs
    */
   static async execGuestCommand(inst: any, cmd: string): Promise<string> {
-    const guestRootWin = path.resolve(DATA_DIR, "guestfs", inst.uuid, "root");
-    if (!fsSync.existsSync(guestRootWin)) {
-      await this.initGuestFilesystem({
-        uuid: inst.uuid,
-        name: inst.name,
-        hostname: inst.hostname || inst.name,
-        rootPassword: inst.root_password || "root",
-        instanceType: inst.instance_type,
-        vcpus: Number(inst.vcpus),
-        ramMb: Number(inst.ram_mb),
-        diskGb: Number(inst.disk_gb),
-        diskPath: inst.disk_path,
-        macAddress: inst.mac_address,
-        osImage: inst.os_image,
-        ipAddress: inst.ip_address,
-        ipv6Address: inst.ipv6_address,
-        networkMode: inst.network_mode,
-      });
+    const vmFsDirWin = path.resolve(DATA_DIR, "guestfs", inst.uuid);
+    const guestRootWin = path.join(vmFsDirWin, "root");
+    const enterScriptWin = path.join(vmFsDirWin, "enter-vps.sh");
+    if (!fsSync.existsSync(enterScriptWin)) {
+      await this.initGuestFilesystem(
+        {
+          uuid: inst.uuid,
+          name: inst.name,
+          hostname: inst.hostname || inst.name,
+          rootPassword: inst.root_password || "root",
+          instanceType: inst.instance_type,
+          vcpus: Number(inst.vcpus),
+          ramMb: Number(inst.ram_mb),
+          diskGb: Number(inst.disk_gb),
+          diskPath: inst.disk_path,
+          macAddress: inst.mac_address,
+          osImage: inst.os_image,
+          ipAddress: inst.ip_address,
+          ipv6Address: inst.ipv6_address,
+          networkMode: inst.network_mode,
+        },
+        true
+      );
     }
 
     const trimmed = cmd.trim();
@@ -1019,18 +1275,20 @@ ${vcpuPinLines}
       return "";
     }
 
-    // Execute via real Linux bash inside WSL2 (hvm-linux) on Windows or /bin/bash on Linux
+    // Execute inside the isolated per-instance container (chroot + UTS/mount namespace)
+    const containerEntry = `/var/lib/hvm/containers/${inst.uuid}/enter-vps.sh`;
     try {
       if (process.platform === "win32") {
+        const wslVmFs = this.winPathToWslPath(vmFsDirWin);
         const wslGuestRoot = this.winPathToWslPath(guestRootWin);
         const { stdout, stderr } = await execFileAsync(
           "wsl.exe",
           [
             "-d",
             "hvm-linux",
-            "bash",
+            "sh",
             "-c",
-            `cd '${wslGuestRoot}' 2>/dev/null || cd /root; export HOSTNAME='${hostname}'; ${trimmed}`,
+            `mkdir -p '/var/lib/hvm/containers/${inst.uuid}'; cp -f '${wslVmFs}/enter-vps.sh' '${containerEntry}'; chmod 755 '${containerEntry}'; '${containerEntry}' -c ${JSON.stringify(trimmed)}`,
           ],
           { timeout: 6000, windowsHide: true }
         );
@@ -1038,11 +1296,18 @@ ${vcpuPinLines}
         const combined = `${stdout || ""}${stderr ? (stdout ? "\n" : "") + stderr : ""}`.trimEnd();
         return combined.replace(new RegExp(wslGuestRoot, "g"), "/root");
       } else {
-        const { stdout, stderr } = await execFileAsync("bash", ["-c", trimmed], {
-          cwd: guestRootWin,
-          timeout: 6000,
-          env: { ...process.env, HOSTNAME: hostname },
-        });
+        const { stdout, stderr } = await execFileAsync(
+          "sh",
+          [
+            "-c",
+            `mkdir -p '/var/lib/hvm/containers/${inst.uuid}'; cp -f '${vmFsDirWin}/enter-vps.sh' '${containerEntry}'; chmod 755 '${containerEntry}'; '${containerEntry}' -c ${JSON.stringify(trimmed)}`,
+          ],
+          {
+            cwd: guestRootWin,
+            timeout: 6000,
+            env: { ...process.env, HOSTNAME: hostname },
+          }
+        );
         return `${stdout || ""}${stderr ? (stdout ? "\n" : "") + stderr : ""}`.trimEnd();
       }
     } catch (err: any) {
@@ -1240,6 +1505,7 @@ ${vcpuPinLines}
     await fs.unlink(seedIsoPath).catch(() => {});
     if (uuid) {
       await fs.rm(path.join(DATA_DIR, "guestfs", uuid), { recursive: true, force: true }).catch(() => {});
+      await fs.rm(`/var/lib/hvm/containers/${uuid}`, { recursive: true, force: true }).catch(() => {});
     }
   }
 }

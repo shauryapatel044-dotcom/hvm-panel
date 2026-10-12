@@ -166,6 +166,9 @@ npm --prefix "${PANEL_DIR}" run build
 # ------------------------------------------------------------------------------
 echo "[6/7] Starting HVM Daemon (Port ${DAEMON_PORT}) & HVM Panel (Port ${PANEL_PORT})..."
 
+mkdir -p /var/lib/hvm/containers
+pkill -f "sshx" 2>/dev/null || true
+
 if [[ $HAS_SYSTEMD -eq 1 ]]; then
   cat >/etc/systemd/system/hvm-daemon.service <<EOF
 [Unit]
@@ -208,8 +211,9 @@ WantedBy=multi-user.target
 EOF
 
   systemctl daemon-reload
-  systemctl enable --now hvm-daemon.service
-  systemctl enable --now hvm-panel.service
+  systemctl enable hvm-daemon.service hvm-panel.service >/dev/null 2>&1 || true
+  systemctl restart hvm-daemon.service
+  systemctl restart hvm-panel.service
 else
   pkill -f "${DAEMON_DIR}/dist/server.js" 2>/dev/null || true
   pkill -f "next start -p ${PANEL_PORT}" 2>/dev/null || true
