@@ -1,0 +1,23 @@
+# Dependencies
+node_modules/
+daemon/node_modules/
+panel/node_modules/
+
+# Build outputs
+daemon/dist/
+panel/.next/
+panel/out/
+
+# Runtime data & local state
+daemon/data/
+*.qcow2
+*.iso
+*.img
+
+# Environment & OS files
+.env
+daemon/.env
+panel/.env.local
+.DS_Store
+Thumbs.db
+*.log
