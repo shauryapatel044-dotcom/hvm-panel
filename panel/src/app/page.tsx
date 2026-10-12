@@ -144,16 +144,7 @@ const DEFAULT_OS_CATALOG: OsImageOption[] = [
   { id: "arch-cloud", label: "Arch Linux Cloud (Rolling)", distro: "Arch", filename: "Arch-Linux-x86_64-cloudimg.qcow2", kernel: "6.10.8-arch1-1" },
 ];
 
-const getApiBase = () => {
-  if (typeof window !== "undefined") {
-    const host = window.location.hostname;
-    if (host === "localhost" || host === "127.0.0.1" || host === "[::1]" || host === "::1") {
-      return "http://127.0.0.1:5090/api";
-    }
-    return `${window.location.protocol}//${host}:5090/api`;
-  }
-  return "http://127.0.0.1:5090/api";
-};
+const getApiBase = () => "/api";
 
 export default function HVMDashboard() {
   const [token, setToken] = useState<string | null>(null);

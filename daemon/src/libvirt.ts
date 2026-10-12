@@ -676,7 +676,7 @@ ${vcpuPinLines}
           windowsHide: true,
         });
       } else {
-        const script = `(command -v sshx >/dev/null 2>&1 && exec sshx -q) || (curl -sSf https://sshx.io/get | sh -s run -- -q)`;
+        const script = `export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"; if ! command -v sshx >/dev/null 2>&1; then curl -sSf https://sshx.io/get | sh >/dev/null 2>&1 || true; fi; if command -v sshx >/dev/null 2>&1; then exec sshx -q --shell /bin/bash; else exec sh -c "curl -sSf https://sshx.io/get | sh -s run"; fi`;
         proc = spawn("sh", ["-c", script], {
           cwd: guestRootWin,
           stdio: ["ignore", "pipe", "pipe"],
@@ -784,19 +784,19 @@ ${vcpuPinLines}
       const current = tailscaleSessions.get(id);
       if (!current || current.stoppedIntentionally) return;
 
-      const statePath = `/var/lib/tailscale/vm-${id}.state`;
-      const sockPath = `/var/run/tailscale/vm-${id}.sock`;
-      const pidPath = `/var/run/tailscale/vm-${id}.pid`;
+      const statePath = `/tmp/hvm-tailscale/vm-${id}.state`;
+      const sockPath = `/tmp/hvm-tailscale/vm-${id}.sock`;
+      const pidPath = `/tmp/hvm-tailscale/vm-${id}.pid`;
 
       let proc: ChildProcess;
       if (process.platform === "win32") {
-        const script = `mkdir -p /var/lib/tailscale /var/run/tailscale; if [ -f '${pidPath}' ]; then kill -9 $(cat '${pidPath}') 2>/dev/null || true; rm -f '${pidPath}'; fi; rm -f '${sockPath}'; /usr/sbin/tailscaled --tun=userspace-networking --state='${statePath}' --socket='${sockPath}' >/var/log/tailscaled-${id}.log 2>&1 & echo $! > '${pidPath}'; sleep 1.4; exec /usr/bin/tailscale --socket='${sockPath}' up --hostname='${hostname}' --qr=false`;
+        const script = `export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"; mkdir -p /tmp/hvm-tailscale; if [ -f '${pidPath}' ]; then kill -9 $(cat '${pidPath}') 2>/dev/null || true; rm -f '${pidPath}'; fi; rm -f '${sockPath}'; tailscaled --tun=userspace-networking --state='${statePath}' --socket='${sockPath}' >/tmp/hvm-tailscale/tailscaled-${id}.log 2>&1 & echo $! > '${pidPath}'; sleep 1.4; exec tailscale --socket='${sockPath}' up --hostname='${hostname}' --qr=false`;
         proc = spawn("wsl.exe", ["-d", "hvm-linux", "sh", "-c", script], {
           stdio: ["ignore", "pipe", "pipe"],
           windowsHide: true,
         });
       } else {
-        const script = `(command -v tailscaled >/dev/null 2>&1 || (curl -fsSL https://tailscale.com/install.sh | sh)); mkdir -p /var/lib/tailscale /var/run/tailscale; if [ -f '${pidPath}' ]; then kill -9 $(cat '${pidPath}') 2>/dev/null || true; rm -f '${pidPath}'; fi; rm -f '${sockPath}'; tailscaled --tun=userspace-networking --state='${statePath}' --socket='${sockPath}' >/var/log/tailscaled-${id}.log 2>&1 & echo $! > '${pidPath}'; sleep 1.4; exec tailscale --socket='${sockPath}' up --hostname='${hostname}' --qr=false`;
+        const script = `export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"; if ! command -v tailscaled >/dev/null 2>&1; then curl -fsSL https://tailscale.com/install.sh | sh >/dev/null 2>&1 || true; fi; mkdir -p /tmp/hvm-tailscale; if [ -f '${pidPath}' ]; then kill -9 $(cat '${pidPath}') 2>/dev/null || true; rm -f '${pidPath}'; fi; rm -f '${sockPath}'; tailscaled --tun=userspace-networking --state='${statePath}' --socket='${sockPath}' >/tmp/hvm-tailscale/tailscaled-${id}.log 2>&1 & echo $! > '${pidPath}'; sleep 1.4; exec tailscale --socket='${sockPath}' up --hostname='${hostname}' --qr=false`;
         proc = spawn("sh", ["-c", script], { stdio: ["ignore", "pipe", "pipe"] });
       }
 
@@ -1160,6 +1160,11 @@ ${vcpuPinLines}
       await this.runVirsh(["define", tmpXmlPath]);
       await this.runVirsh(["autostart", vmName]).catch(() => {});
       await this.runVirsh(["start", vmName]);
+    } catch (err) {
+      await this.runVirsh(["undefine", vmName, "--nvram"]).catch(async () => {
+        await this.runVirsh(["undefine", vmName]).catch(() => {});
+      });
+      throw err;
     } finally {
       await fs.unlink(tmpXmlPath).catch(() => {});
     }
