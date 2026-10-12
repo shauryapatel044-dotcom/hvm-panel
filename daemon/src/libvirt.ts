@@ -786,16 +786,17 @@ ${vcpuPinLines}
 
       const statePath = `/var/lib/tailscale/vm-${id}.state`;
       const sockPath = `/var/run/tailscale/vm-${id}.sock`;
+      const pidPath = `/var/run/tailscale/vm-${id}.pid`;
 
       let proc: ChildProcess;
       if (process.platform === "win32") {
-        const script = `mkdir -p /var/lib/tailscale /var/run/tailscale; pkill -f '${sockPath}' 2>/dev/null || true; nohup /usr/sbin/tailscaled --tun=userspace-networking --state='${statePath}' --socket='${sockPath}' >/var/log/tailscaled-${id}.log 2>&1 & sleep 1.2; exec /usr/bin/tailscale --socket='${sockPath}' up --hostname='${hostname}' --qr=false`;
+        const script = `mkdir -p /var/lib/tailscale /var/run/tailscale; if [ -f '${pidPath}' ]; then kill -9 $(cat '${pidPath}') 2>/dev/null || true; rm -f '${pidPath}'; fi; rm -f '${sockPath}'; /usr/sbin/tailscaled --tun=userspace-networking --state='${statePath}' --socket='${sockPath}' >/var/log/tailscaled-${id}.log 2>&1 & echo $! > '${pidPath}'; sleep 1.4; exec /usr/bin/tailscale --socket='${sockPath}' up --hostname='${hostname}' --qr=false`;
         proc = spawn("wsl.exe", ["-d", "hvm-linux", "sh", "-c", script], {
           stdio: ["ignore", "pipe", "pipe"],
           windowsHide: true,
         });
       } else {
-        const script = `(command -v tailscaled >/dev/null 2>&1 || (curl -fsSL https://tailscale.com/install.sh | sh)); mkdir -p /var/lib/tailscale /var/run/tailscale; pkill -f '${sockPath}' 2>/dev/null || true; nohup tailscaled --tun=userspace-networking --state='${statePath}' --socket='${sockPath}' >/var/log/tailscaled-${id}.log 2>&1 & sleep 1.2; exec tailscale --socket='${sockPath}' up --hostname='${hostname}' --qr=false`;
+        const script = `(command -v tailscaled >/dev/null 2>&1 || (curl -fsSL https://tailscale.com/install.sh | sh)); mkdir -p /var/lib/tailscale /var/run/tailscale; if [ -f '${pidPath}' ]; then kill -9 $(cat '${pidPath}') 2>/dev/null || true; rm -f '${pidPath}'; fi; rm -f '${sockPath}'; tailscaled --tun=userspace-networking --state='${statePath}' --socket='${sockPath}' >/var/log/tailscaled-${id}.log 2>&1 & echo $! > '${pidPath}'; sleep 1.4; exec tailscale --socket='${sockPath}' up --hostname='${hostname}' --qr=false`;
         proc = spawn("sh", ["-c", script], { stdio: ["ignore", "pipe", "pipe"] });
       }
 
