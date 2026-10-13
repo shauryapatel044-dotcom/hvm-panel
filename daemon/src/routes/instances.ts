@@ -416,6 +416,14 @@ router.post("/:id/power", async (req: Request, res: Response) => {
       await pool.query("UPDATE instances SET status = ? WHERE id = ?", [newStatus, instanceId]);
       inst.status = newStatus;
       consoleBuffers.delete(instanceId);
+      const bootErr = LibvirtService.lastBootErrors.get(inst.name);
+      if (action === "start" && bootErr) {
+        res.status(500).json({
+          error: `Failed to boot VM '${inst.name}': ${bootErr}`,
+          status: "stopped",
+        });
+        return;
+      }
       res.json({ id: instanceId, name: inst.name, action, status: "stopped", boot_progress: 0 });
     }
   } catch (err: any) {

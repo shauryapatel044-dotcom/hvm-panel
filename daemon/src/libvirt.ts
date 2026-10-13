@@ -156,6 +156,8 @@ export interface DomainSpec {
 }
 
 export class LibvirtService {
+  static lastBootErrors = new Map<string, string>();
+
   /**
    * Generates a unique locally administered QEMU/KVM MAC address
    */
@@ -1399,12 +1401,14 @@ ${cpuXml}`;
           try {
             await QemuVpsService.bootVm(conf as VmConfig);
             startedViaQemu = true;
+            this.lastBootErrors.delete(vmName);
             console.log(
               `[HVM-Power] VM '${vmName}' successfully booted with QEMU (PID: ${await QemuVpsService.getVmPid(
                 vmName
               )})`
             );
           } catch (qemuErr: any) {
+            this.lastBootErrors.set(vmName, qemuErr.message);
             console.warn(`[HVM-Power] QEMU direct boot note for '${vmName}': ${qemuErr.message}`);
           }
         }
@@ -1412,8 +1416,12 @@ ${cpuXml}`;
         if (!startedViaQemu) {
           try {
             await this.runVirsh(["start", vmName]);
+            this.lastBootErrors.delete(vmName);
             console.log(`[HVM-Power] Domain '${vmName}' started with virsh`);
           } catch (virshErr: any) {
+            if (!this.lastBootErrors.has(vmName)) {
+              this.lastBootErrors.set(vmName, virshErr.message);
+            }
             console.warn(`[HVM-Power] Virsh start note for '${vmName}': ${virshErr.message}`);
           }
         }
