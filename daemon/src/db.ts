@@ -369,8 +369,14 @@ async function executeLocalQuery(sql: string, params: any[] = []): Promise<[any,
     return [{ affectedRows: inst ? 1 : 0 }, null];
   }
 
-  if (upper.startsWith("UPDATE INSTANCES SET STATUS = ?, BOOTED_AT = ? WHERE ID = ?")) {
-    const [status, bootedAt, id] = params;
+  if (
+    upper.startsWith("UPDATE INSTANCES SET STATUS = ?, BOOTED_AT = NOW() WHERE ID = ?") ||
+    upper.startsWith("UPDATE INSTANCES SET STATUS = ?, BOOTED_AT = ? WHERE ID = ?")
+  ) {
+    const isNow = upper.includes("BOOTED_AT = NOW()");
+    const status = params[0];
+    const bootedAt = isNow ? new Date().toISOString() : params[1];
+    const id = isNow ? params[1] : params[2];
     const inst = store.instances.find((i) => Number(i.id) === Number(id));
     if (inst) {
       inst.status = status;
@@ -398,10 +404,16 @@ async function executeLocalQuery(sql: string, params: any[] = []): Promise<[any,
 
   if (
     upper.startsWith(
+      "UPDATE INSTANCES SET OS_IMAGE = ?, ROOT_PASSWORD = ?, STATUS = 'RUNNING', BOOTED_AT = NOW() WHERE ID = ?"
+    ) ||
+    upper.startsWith(
       "UPDATE INSTANCES SET OS_IMAGE = ?, ROOT_PASSWORD = ?, STATUS = 'RUNNING', BOOTED_AT = ? WHERE ID = ?"
     )
   ) {
-    const [osImage, rootPass, bootedAt, id] = params;
+    const isNow = upper.includes("BOOTED_AT = NOW()");
+    const [osImage, rootPass] = params;
+    const bootedAt = isNow ? new Date().toISOString() : params[2];
+    const id = isNow ? params[2] : params[3];
     const inst = store.instances.find((i) => Number(i.id) === Number(id));
     if (inst) {
       inst.os_image = osImage;

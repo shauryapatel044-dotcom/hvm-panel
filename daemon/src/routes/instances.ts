@@ -397,9 +397,8 @@ router.post("/:id/power", async (req: Request, res: Response) => {
     const nowIso = new Date().toISOString();
     if (newStatus === "running") {
       LibvirtService.stopSshxSession(instanceId);
-      await pool.query("UPDATE instances SET status = ?, booted_at = ? WHERE id = ?", [
+      await pool.query("UPDATE instances SET status = ?, booted_at = NOW() WHERE id = ?", [
         newStatus,
-        nowIso,
         instanceId,
       ]);
       inst.status = newStatus;
@@ -550,9 +549,10 @@ router.post("/:id/reinstall", async (req: Request, res: Response) => {
 
     const now = new Date().toISOString();
     await pool.query(
-      "UPDATE instances SET os_image = ?, root_password = ?, status = 'running', booted_at = ? WHERE id = ?",
-      [newImage, newPass, now, instanceId]
+      "UPDATE instances SET os_image = ?, root_password = ?, status = 'running', booted_at = NOW() WHERE id = ?",
+      [newImage, newPass, instanceId]
     );
+    inst.booted_at = now;
 
     consoleBuffers.delete(instanceId);
 
