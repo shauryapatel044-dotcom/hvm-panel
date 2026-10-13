@@ -380,6 +380,25 @@ export class LibvirtService {
       ].join("\n")
     );
 
+    const cpuOnlineStr = vcpus <= 1 ? "0" : `0-${maxCpuIdx}`;
+    await writeLf(path.join(vmFsRoot, "etc", "cpu-online"), `${cpuOnlineStr}\n`);
+
+    const statCpuLines = [
+      `cpu  12040 120 4820 984120 410 0 180 0 0 0`,
+      ...Array.from(
+        { length: vcpus },
+        (_, idx) => `cpu${idx} 3010 30 1205 246030 102 0 45 0 0 0`
+      ),
+      `intr 482910 18 0 0 0 0 0 0 0 1 0 0 0 142 0 0 0`,
+      `ctxt 948210`,
+      `btime ${Math.floor(Date.now() / 1000) - 60}`,
+      `processes 1420`,
+      `procs_running 1`,
+      `procs_blocked 0`,
+      `softirq 284910 0 98210 12 4120 810 0 120 84210 0 97428`,
+    ].join("\n");
+    await writeLf(path.join(vmFsRoot, "etc", "proc-stat"), `${statCpuLines}\n`);
+
     const linuxGuestFsDir =
       process.platform === "win32" ? this.winPathToWslPath(vmFsRoot) : vmFsRoot;
     const containerDir = `/var/lib/hvm/containers/${spec.uuid}`;
@@ -390,36 +409,17 @@ export class LibvirtService {
     );
     await writeLf(
       path.join(vmFsRoot, "etc", "hvm-bashrc"),
-      `export HVM_ROOT="${linuxGuestFsDir}/root"
-export HVM_CONTAINER="${containerDir}"
-export HOME="\${HVM_ROOT}"
+      `export HOME=/root
 export USER=root
 export LOGNAME=root
 export HOSTNAME="${spec.hostname}"
-export PATH="${containerDir}/vbin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 export PS1="root@${spec.hostname}:\\w# "
-
-pwd() {
-  builtin pwd | sed "s|^\${HVM_ROOT}|/root|; s|^\${HVM_CONTAINER}/storage||"
-}
-
-cd() {
-  if [ \$# -eq 0 ] || [ "\$1" = "~" ] || [ "\$1" = "/root" ]; then
-    builtin cd "\${HVM_ROOT}"
-  elif [ "\$1" = "/home" ]; then
-    builtin cd "\${HVM_CONTAINER}/storage/home"
-  elif [ "\$1" = "/tmp" ]; then
-    builtin cd "\${HVM_CONTAINER}/storage/tmp"
-  else
-    builtin cd "\$@"
-  fi
-}
-
-builtin cd "\${HVM_ROOT}" 2>/dev/null || true
+cd /root 2>/dev/null || true
 `
     );
 
-    // 2. Virtualized hardware, filesystem & OS binaries in vbin/ (placed first in PATH inside the isolated VPS)
+    // 2. Virtualized hardware & OS binaries installed into /usr/local/bin inside the VPS's private OverlayFS disk
     await writeLf(
       path.join(vmFsRoot, "vbin", "hostname"),
       `#!/bin/sh\nif [ "$1" = "-I" ] || [ "$1" = "-i" ]; then\n  echo "${cleanIp}"\nelse\n  echo "${spec.hostname}"\nfi\n`
@@ -439,7 +439,7 @@ builtin cd "\${HVM_ROOT}" 2>/dev/null || true
     );
     await writeLf(
       path.join(vmFsRoot, "vbin", "lscpu"),
-      `#!/bin/sh\ncat << 'EOF'\nArchitecture:            x86_64\nCPU op-mode(s):          32-bit, 64-bit\nByte Order:              Little Endian\nCPU(s):                  ${vcpus}\nOn-line CPU(s) list:     0-${maxCpuIdx}\nVendor ID:               GenuineIntel\nModel name:              QEMU Virtual CPU version 2.5+ (${spec.instanceType} Mode)\nThread(s) per core:      1\nCore(s) per socket:      ${vcpus}\nSocket(s):               1\nHypervisor vendor:       KVM\nVirtualization type:     full\nEOF\n`
+      `#!/bin/sh\ncat << 'EOF'\nArchitecture:            x86_64\nCPU op-mode(s):          32-bit, 64-bit\nByte Order:              Little Endian\nCPU(s):                  ${vcpus}\nOn-line CPU(s) list:     ${cpuOnlineStr}\nVendor ID:               GenuineIntel\nModel name:              QEMU Virtual CPU version 2.5+ (${spec.instanceType} Mode)\nThread(s) per core:      1\nCore(s) per socket:      ${vcpus}\nSocket(s):               1\nHypervisor vendor:       KVM\nVirtualization type:     full\nEOF\n`
     );
     await writeLf(
       path.join(vmFsRoot, "vbin", "free"),
@@ -447,68 +447,22 @@ builtin cd "\${HVM_ROOT}" 2>/dev/null || true
     );
     await writeLf(
       path.join(vmFsRoot, "vbin", "df"),
-      `#!/bin/sh\nDISK_GB=${diskGb}\nUSED_GB=2\nAVAIL_GB=$((DISK_GB - USED_GB))\nPCT=$((USED_GB * 100 / DISK_GB))\nif [ "$1" = "-h" ]; then\n  printf "Filesystem      Size  Used Avail Use%% Mounted on\\n"\n  printf "/dev/vda1       %3dG  2.1G  %3dG  %2d%% /\\n" "$DISK_GB" "$AVAIL_GB" "$PCT"\n  printf "tmpfs           512M     0  512M   0%% /dev/shm\\n"\nelse\n  printf "Filesystem     1K-blocks    Used Available Use%% Mounted on\\n"\n  printf "/dev/vda1      %9d 2202009 %9d  %2d%% /\\n" "$((DISK_GB * 1048576))" "$((AVAIL_GB * 1048576))" "$PCT"\nfi\n`
+      `#!/bin/sh\nif /bin/df "$@" 2>/dev/null | grep -q "/dev/loop"; then\n  /bin/df "$@" | sed 's|/dev/loop[0-9]*|/dev/vda1|g; s|^overlay|/dev/vda1|g'\n  exit 0\nfi\nDISK_GB=${diskGb}\nUSED_GB=2\nAVAIL_GB=$((DISK_GB - USED_GB))\nPCT=$((USED_GB * 100 / DISK_GB))\nif [ "$1" = "-h" ]; then\n  printf "Filesystem      Size  Used Avail Use%% Mounted on\\n"\n  printf "/dev/vda1       %3dG  2.1G  %3dG  %2d%% /\\n" "$DISK_GB" "$AVAIL_GB" "$PCT"\n  printf "tmpfs           512M     0  512M   0%% /dev/shm\\n"\nelse\n  printf "Filesystem     1K-blocks    Used Available Use%% Mounted on\\n"\n  printf "/dev/vda1      %9d 2202009 %9d  %2d%% /\\n" "$((DISK_GB * 1048576))" "$((AVAIL_GB * 1048576))" "$PCT"\nfi\n`
     );
     await writeLf(
       path.join(vmFsRoot, "vbin", "ip"),
       `#!/bin/sh\nif [ "$1" = "a" ] || [ "$1" = "addr" ] || [ "$1" = "address" ] || [ -z "$1" ]; then\n  echo "1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN group default qlen 1000"\n  echo "    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00"\n  echo "    inet 127.0.0.1/8 scope host lo"\n  echo "2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc fq_codel state UP group default qlen 1000"\n  echo "    link/ether ${spec.macAddress} brd ff:ff:ff:ff:ff:ff"\n  echo "    inet ${cleanIp}/24 brd 255.255.255.255 scope global eth0"\n  echo "    inet6 ${cleanIpv6} scope global"\nelif [ "$1" = "r" ] || [ "$1" = "route" ]; then\n  echo "default via 10.0.80.1 dev eth0 proto dhcp"\nelse\n  /sbin/ip "$@" 2>/dev/null || /bin/ip "$@" 2>/dev/null\nfi\n`
     );
-    await writeLf(
-      path.join(vmFsRoot, "vbin", "pwd"),
-      `#!/bin/sh\n/bin/pwd | sed "s|^${linuxGuestFsDir}/root|/root|; s|^${containerDir}/storage||"\n`
-    );
 
-    const pathRewriteHelper = `
-rewrite_arg() {
-  case "$1" in
-    /root) printf "%s\\n" "${linuxGuestFsDir}/root" ;;
-    /root/*) printf "%s\\n" "${linuxGuestFsDir}/root/\${1#/root/}" ;;
-    /home) printf "%s\\n" "${containerDir}/storage/home" ;;
-    /home/*) printf "%s\\n" "${containerDir}/storage/home/\${1#/home/}" ;;
-    /tmp) printf "%s\\n" "${containerDir}/storage/tmp" ;;
-    /tmp/*) printf "%s\\n" "${containerDir}/storage/tmp/\${1#/tmp/}" ;;
-    /etc/os-release) printf "%s\\n" "${containerDir}/etc/os-release" ;;
-    /etc/lsb-release) printf "%s\\n" "${containerDir}/etc/lsb-release" ;;
-    /etc/hostname) printf "%s\\n" "${containerDir}/etc/hostname" ;;
-    /etc/hosts) printf "%s\\n" "${containerDir}/etc/hosts" ;;
-    /etc/issue) printf "%s\\n" "${containerDir}/etc/issue" ;;
-    /proc/meminfo) printf "%s\\n" "${containerDir}/etc/meminfo" ;;
-    /proc/cpuinfo) printf "%s\\n" "${containerDir}/etc/cpuinfo" ;;
-    *) printf "%s\\n" "$1" ;;
-  esac
-}
-`;
-
-    for (const cmdName of ["ls", "cat", "grep", "head", "tail"]) {
-      await writeLf(
-        path.join(vmFsRoot, "vbin", cmdName),
-        `#!/bin/sh
-${pathRewriteHelper}
-REAL_BIN="/bin/${cmdName}"
-if [ ! -x "\$REAL_BIN" ]; then
-  REAL_BIN="/usr/bin/${cmdName}"
-fi
-set -- "\$@"
-NEW_ARGS=""
-for arg in "\$@"; do
-  MAPPED=\$(rewrite_arg "\$arg")
-  escape_arg=\$(printf "%s" "\$MAPPED" | sed "s/'/'\\\\\\\\''/g")
-  NEW_ARGS="\$NEW_ARGS '\$escape_arg'"
-done
-eval "exec \\"\$REAL_BIN\\" \$NEW_ARGS"
-`
-      );
-    }
-
-    // Virtualized neofetch / fastfetch / screenfetch showing the exact new VPS/VDS hardware & OS specs
     const usedRamMb = Math.floor(ramMb * 0.14);
     const diskPct = Math.max(1, Math.floor((2 / diskGb) * 100));
     const dashLine = "-".repeat(`root@${spec.hostname}`.length);
     const neofetchScript = `#!/bin/sh
 C="\\033[1;36m"
-W="\\033[1;37m"
 R="\\033[0m"
-UP_MIN=$(( ($(date +%s) - ${Math.floor(Date.now() / 1000)}) / 60 + 1 ))
+NOW_TS=\$(date +%s 2>/dev/null || echo ${Math.floor(Date.now() / 1000)})
+UP_MIN=\$(( (NOW_TS - ${Math.floor(Date.now() / 1000)}) / 60 + 1 ))
+if [ "\$UP_MIN" -lt 1 ] 2>/dev/null; then UP_MIN=1; fi
 printf "\\n"
 printf "            \${C}.-,/+oossssoo+/-.\${R}               \${C}root\${R}@\${C}${spec.hostname}\${R}\\n"
 printf "        \${C}':+ssssssssssssssssss+:'\${R}           ${dashLine}\\n"
@@ -535,7 +489,6 @@ printf "            \${C}.-,/+oossssoo+/-.\${R}\\n\\n"
       await writeLf(path.join(vmFsRoot, "vbin", fetchBin), neofetchScript);
     }
 
-    // Smart apt / apt-get wrapper that automatically clears stuck dpkg/apt locks and handles neofetch/fastfetch
     for (const aptBin of ["apt", "apt-get"]) {
       await writeLf(
         path.join(vmFsRoot, "vbin", aptBin),
@@ -561,49 +514,187 @@ case "\$ALL_ARGS" in
     ;;
 esac
 
-if fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || fuser /var/lib/dpkg/lock >/dev/null 2>&1 || [ -f /var/lib/dpkg/lock-frontend ]; then
-  killall -9 apt apt-get unattended-upgr 2>/dev/null || true
-  rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock /var/lib/apt/lists/lock 2>/dev/null || true
-  dpkg --configure -a >/dev/null 2>&1 || true
-fi
-
+rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock /var/lib/apt/lists/lock 2>/dev/null || true
 exec /usr/bin/${aptBin} "\$@"
 `
       );
     }
 
-    // 3. Isolated Container Entrypoint Script (zero mount --bind calls so it never leaks mounts to the host)
+    // 3. Persistent Private Namespace Container Daemon (init-container.sh)
+    // Creates a real ${diskGb}G ext4 loop disk, mounts overlayfs on ${ROOTFS} with mount --make-rprivate /,
+    // applies cgroup v2 RAM (${ramMb}M) & CPU (${vcpus} cores) limits, and bind-mounts /proc/meminfo & /proc/cpuinfo
+    const ramBytes = ramMb * 1024 * 1024;
+    const cpuQuota = vcpus * 100000;
+
+    await writeLf(
+      path.join(vmFsRoot, "init-container.sh"),
+      `#!/bin/sh
+# Runs inside unshare --uts --mount
+mount --make-rprivate / 2>/dev/null || true
+
+CONTAINER_DIR="${containerDir}"
+GUEST_FS="${linuxGuestFsDir}"
+DISK_IMG="\${CONTAINER_DIR}/disk.img"
+DISK_MNT="\${CONTAINER_DIR}/disk-mnt"
+ROOTFS="\${CONTAINER_DIR}/rootfs"
+
+mkdir -p "\${CONTAINER_DIR}" "\${DISK_MNT}" "\${ROOTFS}"
+
+/bin/hostname "${spec.hostname}" 2>/dev/null || hostname "${spec.hostname}" 2>/dev/null || true
+
+# 1. Configure real Linux Cgroup v2 hardware limits for RAM (${ramMb} MB) and CPU (${vcpus} Cores)
+CG_DIR="/sys/fs/cgroup/hvm-${spec.uuid}"
+if [ -d /sys/fs/cgroup ]; then
+  echo "+memory +cpu +cpuset" > /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null || true
+  mkdir -p "\${CG_DIR}" 2>/dev/null || true
+  echo "${ramBytes}" > "\${CG_DIR}/memory.max" 2>/dev/null || true
+  echo "0" > "\${CG_DIR}/memory.swap.max" 2>/dev/null || true
+  echo "${cpuQuota} 100000" > "\${CG_DIR}/cpu.max" 2>/dev/null || true
+  echo "${cpuOnlineStr}" > "\${CG_DIR}/cpuset.cpus" 2>/dev/null || true
+  echo \$\$ > "\${CG_DIR}/cgroup.procs" 2>/dev/null || true
+fi
+
+# 2. Create & mount dedicated ${diskGb} GB ext4 virtual disk image (disk.img)
+if [ ! -f "\${DISK_IMG}" ]; then
+  truncate -s ${diskGb}G "\${DISK_IMG}" 2>/dev/null || dd if=/dev/zero of="\${DISK_IMG}" bs=1M count=0 seek=$(( ${diskGb} * 1024 )) 2>/dev/null
+  mkfs.ext4 -F -q -E lazy_itable_init=1,lazy_journal_init=1 -m 0 "\${DISK_IMG}" >/dev/null 2>&1 || true
+fi
+
+mount -o loop "\${DISK_IMG}" "\${DISK_MNT}" 2>/dev/null || true
+mkdir -p "\${DISK_MNT}/upper" "\${DISK_MNT}/work"
+
+# 3. Mount copy-on-write OverlayFS root filesystem backed by the ${diskGb}G ext4 disk
+if ! mount -t overlay overlay -o "lowerdir=/,upperdir=\${DISK_MNT}/upper,workdir=\${DISK_MNT}/work" "\${ROOTFS}" 2>/dev/null; then
+  for d in bin sbin usr lib lib64 etc var run; do
+    if [ -d "/\$d" ]; then
+      mkdir -p "\${ROOTFS}/\$d"
+      mount --bind "/\$d" "\${ROOTFS}/\$d" 2>/dev/null || true
+    fi
+  done
+fi
+
+# 4. Isolate /root, /home, /tmp on the VPS's dedicated storage & clear any host dpkg locks in upper layer
+mkdir -p "\${GUEST_FS}/root" "\${DISK_MNT}/home" "\${DISK_MNT}/tmp" "\${ROOTFS}/root" "\${ROOTFS}/home" "\${ROOTFS}/tmp"
+chmod 1777 "\${DISK_MNT}/tmp" 2>/dev/null || true
+mount --bind "\${GUEST_FS}/root" "\${ROOTFS}/root" 2>/dev/null || true
+mount --bind "\${DISK_MNT}/home" "\${ROOTFS}/home" 2>/dev/null || true
+mount --bind "\${DISK_MNT}/tmp" "\${ROOTFS}/tmp" 2>/dev/null || true
+rm -f "\${ROOTFS}/var/lib/dpkg/lock-frontend" "\${ROOTFS}/var/lib/dpkg/lock" "\${ROOTFS}/var/cache/apt/archives/lock" "\${ROOTFS}/var/lib/apt/lists/lock" 2>/dev/null || true
+
+# 5. Mount virtual filesystems (/proc, /sys, /dev) inside private namespace
+mkdir -p "\${ROOTFS}/proc" "\${ROOTFS}/sys" "\${ROOTFS}/dev"
+mount -t proc proc "\${ROOTFS}/proc" 2>/dev/null || mount --bind /proc "\${ROOTFS}/proc" 2>/dev/null || true
+mount --rbind /sys "\${ROOTFS}/sys" 2>/dev/null || true
+mount --make-rslave "\${ROOTFS}/sys" 2>/dev/null || true
+mount --rbind /dev "\${ROOTFS}/dev" 2>/dev/null || true
+mount --make-rslave "\${ROOTFS}/dev" 2>/dev/null || true
+
+# 6. Bind-mount dedicated RAM (/proc/meminfo), CPU cores (/proc/cpuinfo, /proc/stat, /sys/devices/system/cpu/online), and OS identity
+for pf in cpuinfo meminfo; do
+  if [ -f "\${CONTAINER_DIR}/etc/\$pf" ] && [ -e "\${ROOTFS}/proc/\$pf" ]; then
+    mount --bind "\${CONTAINER_DIR}/etc/\$pf" "\${ROOTFS}/proc/\$pf" 2>/dev/null || true
+  fi
+done
+if [ -f "\${CONTAINER_DIR}/etc/proc-stat" ] && [ -e "\${ROOTFS}/proc/stat" ]; then
+  mount --bind "\${CONTAINER_DIR}/etc/proc-stat" "\${ROOTFS}/proc/stat" 2>/dev/null || true
+fi
+for cf in online present possible; do
+  if [ -f "\${CONTAINER_DIR}/etc/cpu-online" ] && [ -e "\${ROOTFS}/sys/devices/system/cpu/\$cf" ]; then
+    mount --bind "\${CONTAINER_DIR}/etc/cpu-online" "\${ROOTFS}/sys/devices/system/cpu/\$cf" 2>/dev/null || true
+  fi
+done
+
+for f in hostname hosts os-release lsb-release issue; do
+  if [ -f "\${CONTAINER_DIR}/etc/\$f" ]; then
+    touch "\${ROOTFS}/etc/\$f" 2>/dev/null || true
+    mount --bind "\${CONTAINER_DIR}/etc/\$f" "\${ROOTFS}/etc/\$f" 2>/dev/null || true
+  fi
+done
+cp -f "\${CONTAINER_DIR}/etc/hvm-bashrc" "\${ROOTFS}/etc/hvm-bashrc" 2>/dev/null || true
+cp -f "\${CONTAINER_DIR}/etc/hvm-bashrc" "\${ROOTFS}/root/.bashrc" 2>/dev/null || true
+
+mkdir -p "\${ROOTFS}/usr/local/bin"
+mount --bind "\${CONTAINER_DIR}/vbin" "\${ROOTFS}/usr/local/bin" 2>/dev/null || true
+
+echo \$\$ > "\${CONTAINER_DIR}/container.pid"
+while true; do
+  sleep 3600
+done
+`
+    );
+
+    // 4. Container Entrypoint Script (enter-vps.sh) — attaches to the persistent container via nsenter + chroot
     await writeLf(
       path.join(vmFsRoot, "enter-vps.sh"),
       `#!/bin/sh
 CONTAINER_DIR="${containerDir}"
 GUEST_FS="${linuxGuestFsDir}"
+ROOTFS="\${CONTAINER_DIR}/rootfs"
+PID_FILE="\${CONTAINER_DIR}/container.pid"
 
 mkdir -p "\${CONTAINER_DIR}/etc" "\${CONTAINER_DIR}/vbin" "\${GUEST_FS}/root"
-for p in home tmp opt srv mnt; do
-  mkdir -p "\${CONTAINER_DIR}/storage/\$p"
-done
-
 cp -rf "\${GUEST_FS}/etc/." "\${CONTAINER_DIR}/etc/" 2>/dev/null || true
 cp -rf "\${GUEST_FS}/vbin/." "\${CONTAINER_DIR}/vbin/" 2>/dev/null || true
-chmod 755 "\${CONTAINER_DIR}/vbin/"* 2>/dev/null || true
+cp -f "\${GUEST_FS}/init-container.sh" "\${CONTAINER_DIR}/init-container.sh" 2>/dev/null || true
+chmod 755 "\${CONTAINER_DIR}/init-container.sh" "\${CONTAINER_DIR}/vbin/"* 2>/dev/null || true
 
-export HVM_ROOT="\${GUEST_FS}/root"
-export HVM_CONTAINER="\${CONTAINER_DIR}"
+# Start persistent isolated container namespace if not already running
+NEED_START=1
+if [ -f "\${PID_FILE}" ]; then
+  CPID=\$(cat "\${PID_FILE}" 2>/dev/null)
+  if [ -n "\${CPID}" ] && kill -0 "\${CPID}" 2>/dev/null; then
+    NEED_START=0
+  fi
+fi
+
+if [ "\${NEED_START}" -eq 1 ]; then
+  rm -f "\${PID_FILE}" 2>/dev/null || true
+  nohup unshare --uts --mount /bin/sh "\${CONTAINER_DIR}/init-container.sh" >/dev/null 2>&1 &
+  for _i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25; do
+    if [ -f "\${PID_FILE}" ]; then
+      break
+    fi
+    sleep 0.1
+  done
+fi
+
+if [ -f "\${PID_FILE}" ]; then
+  CPID=\$(cat "\${PID_FILE}" 2>/dev/null)
+  if [ -n "\${CPID}" ] && kill -0 "\${CPID}" 2>/dev/null; then
+    if [ -d "/sys/fs/cgroup/hvm-${spec.uuid}" ]; then
+      echo \$\$ > "/sys/fs/cgroup/hvm-${spec.uuid}/cgroup.procs" 2>/dev/null || true
+    fi
+    if [ \$# -gt 0 ]; then
+      exec nsenter -t "\${CPID}" -m -u chroot "\${ROOTFS}" /usr/bin/env -i \\
+        HOME=/root \\
+        USER=root \\
+        LOGNAME=root \\
+        TERM="\${TERM:-xterm-256color}" \\
+        HOSTNAME="${spec.hostname}" \\
+        PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \\
+        /bin/bash "\$@"
+    else
+      exec nsenter -t "\${CPID}" -m -u chroot "\${ROOTFS}" /usr/bin/env -i \\
+        HOME=/root \\
+        USER=root \\
+        LOGNAME=root \\
+        TERM="\${TERM:-xterm-256color}" \\
+        HOSTNAME="${spec.hostname}" \\
+        PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \\
+        PS1="root@${spec.hostname}:\\w# " \\
+        /bin/bash --rcfile /etc/hvm-bashrc -i
+    fi
+  fi
+fi
+
+# Fallback if unshare/nsenter is restricted
 export HOME="\${GUEST_FS}/root"
 export USER=root
 export LOGNAME=root
 export HOSTNAME="${spec.hostname}"
 export PATH="\${CONTAINER_DIR}/vbin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 export PS1="root@${spec.hostname}:\\w# "
-
 cd "\${HOME}" 2>/dev/null || true
-
-if [ -z "\${HVM_UTS_ACTIVE}" ] && unshare --uts true 2>/dev/null; then
-  export HVM_UTS_ACTIVE=1
-  exec unshare --uts /bin/sh -c '/bin/hostname "${spec.hostname}" 2>/dev/null || true; exec "\$0" "\$@"' "\$0" "\$@"
-fi
-
 if [ \$# -gt 0 ]; then
   exec /bin/bash "\$@"
 else
@@ -617,6 +708,7 @@ fi
       await fs.mkdir(`${containerDir}/vbin`, { recursive: true }).catch(() => {});
       await fs.cp(path.join(vmFsRoot, "etc"), `${containerDir}/etc`, { recursive: true, force: true }).catch(() => {});
       await fs.cp(path.join(vmFsRoot, "vbin"), `${containerDir}/vbin`, { recursive: true, force: true }).catch(() => {});
+      await fs.copyFile(path.join(vmFsRoot, "init-container.sh"), `${containerDir}/init-container.sh`).catch(() => {});
       await fs.copyFile(path.join(vmFsRoot, "enter-vps.sh"), `${containerDir}/enter-vps.sh`).catch(() => {});
     }
   }
@@ -1588,7 +1680,28 @@ ${vcpuPinLines}
     await fs.unlink(seedIsoPath).catch(() => {});
     if (uuid) {
       await fs.rm(path.join(DATA_DIR, "guestfs", uuid), { recursive: true, force: true }).catch(() => {});
-      await fs.rm(`/var/lib/hvm/containers/${uuid}`, { recursive: true, force: true }).catch(() => {});
+      if (process.platform === "win32") {
+        await execFileAsync(
+          "wsl.exe",
+          [
+            "-d",
+            "hvm-linux",
+            "sh",
+            "-c",
+            `if [ -f '/var/lib/hvm/containers/${uuid}/container.pid' ]; then kill -9 $(cat '/var/lib/hvm/containers/${uuid}/container.pid') 2>/dev/null || true; fi; rm -rf '/var/lib/hvm/containers/${uuid}' 2>/dev/null || true`,
+          ],
+          { timeout: 3000, windowsHide: true }
+        ).catch(() => {});
+      } else {
+        await execFileAsync(
+          "sh",
+          [
+            "-c",
+            `if [ -f '/var/lib/hvm/containers/${uuid}/container.pid' ]; then kill -9 $(cat '/var/lib/hvm/containers/${uuid}/container.pid') 2>/dev/null || true; fi; rmdir '/sys/fs/cgroup/hvm-${uuid}' 2>/dev/null || true; rm -rf '/var/lib/hvm/containers/${uuid}' 2>/dev/null || true`,
+          ],
+          { timeout: 3000 }
+        ).catch(() => {});
+      }
     }
   }
 }
