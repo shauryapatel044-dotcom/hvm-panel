@@ -823,6 +823,9 @@ fi
     </disk>`;
     }
 
+    const hasKvm = QemuVpsService.hasKvmAcceleration();
+    const domainType = hasKvm ? "kvm" : "qemu";
+
     let cpuAndMemoryXml = "";
     let memBalloonXml = "";
 
@@ -835,6 +838,16 @@ fi
       const vcpuPinLines = cores
         .map((hostCore, idx) => `    <vcpupin vcpu='${idx}' cpuset='${hostCore}'/>`)
         .join("\n");
+
+      const cpuXml = hasKvm
+        ? `  <cpu mode='host-passthrough' check='none' migratable='off'>
+    <topology sockets='1' dies='1' cores='${spec.vcpus}' threads='1'/>
+    <cache mode='passthrough'/>
+  </cpu>`
+        : `  <cpu mode='custom' match='exact'>
+    <model fallback='allow'>qemu64</model>
+    <topology sockets='1' dies='1' cores='${spec.vcpus}' threads='1'/>
+  </cpu>`;
 
       cpuAndMemoryXml = `
   <memory unit='MiB'>${spec.ramMb}</memory>
@@ -849,13 +862,13 @@ fi
 ${vcpuPinLines}
     <emulatorpin cpuset='${cpusetStr}'/>
   </cputune>
-  <cpu mode='host-passthrough' check='none' migratable='off'>
-    <topology sockets='1' dies='1' cores='${spec.vcpus}' threads='1'/>
-    <cache mode='passthrough'/>
-  </cpu>`;
+${cpuXml}`;
       memBalloonXml = `<memballoon model='none'/>`;
     } else {
       const cpuShares = spec.vcpus * 1024;
+      const cpuXml = hasKvm
+        ? `<cpu mode='host-model' check='partial'/>`
+        : `<cpu mode='custom' match='exact'><model fallback='allow'>qemu64</model></cpu>`;
       cpuAndMemoryXml = `
   <memory unit='MiB'>${spec.ramMb}</memory>
   <currentMemory unit='MiB'>${spec.ramMb}</currentMemory>
@@ -863,11 +876,11 @@ ${vcpuPinLines}
   <cputune>
     <shares>${cpuShares}</shares>
   </cputune>
-  <cpu mode='host-model' check='partial'/>`;
+  ${cpuXml}`;
       memBalloonXml = `<memballoon model='virtio'/>`;
     }
 
-    return `<domain type='kvm'>
+    return `<domain type='${domainType}'>
   <name>${spec.name}</name>
   <uuid>${spec.uuid}</uuid>${cpuAndMemoryXml}
   <os>
@@ -886,7 +899,7 @@ ${vcpuPinLines}
   <devices>
     <emulator>/usr/bin/qemu-system-x86_64</emulator>
     <disk type='file' device='disk'>
-      <driver name='qemu' type='qcow2' cache='none' io='native' discard='unmap'/>
+      <driver name='qemu' type='qcow2' cache='writeback' discard='unmap'/>
       <source file='${spec.diskPath}'/>
       <target dev='vda' bus='virtio'/>
     </disk>${cdromXml}
@@ -1311,7 +1324,9 @@ ${vcpuPinLines}
     try {
       await this.runVirsh(["define", tmpXmlPath]);
       await this.runVirsh(["autostart", vmName]).catch(() => {});
-      await this.runVirsh(["start", vmName]).catch(() => {});
+      if (!(await QemuVpsService.isVmRunning(vmName))) {
+        await this.runVirsh(["start", vmName]).catch(() => {});
+      }
     } catch (err: any) {
       console.warn(`[HVM-Libvirt] Libvirt note for '${vmName}': ${err.message}`);
     } finally {
@@ -1345,12 +1360,63 @@ ${vcpuPinLines}
   ): Promise<"running" | "stopped"> {
     switch (action) {
       case "start": {
-        const conf = await QemuVpsService.readConfigFile(vmName);
-        if (conf && conf.name) {
-          await QemuVpsService.bootVm(conf as VmConfig).catch(() => {});
+        let conf = await QemuVpsService.readConfigFile(vmName);
+        if (!conf) {
+          const [rows] = await pool.query<mysql.RowDataPacket[]>(
+            "SELECT * FROM instances WHERE name = ? LIMIT 1",
+            [vmName]
+          );
+          if (rows.length > 0) {
+            const dbInst = rows[0];
+            const synthConf: VmConfig = {
+              name: dbInst.name,
+              osKey: dbInst.os_image || "ubuntu-24.04",
+              osLabel: dbInst.os_image || "Ubuntu",
+              hostname: dbInst.hostname || dbInst.name,
+              username: "root",
+              password: dbInst.root_password || "root",
+              ramMb: Number(dbInst.ram_mb) || 1024,
+              vcpus: Number(dbInst.vcpus) || 1,
+              diskSize: `${dbInst.disk_gb || 20}G`,
+              sshPort: Number(dbInst.nat_port) || 2222,
+              diskPath: dbInst.disk_path || path.join(DISKS_DIR, `${dbInst.name}.qcow2`),
+              seedIso: path.join(SEEDS_DIR, `${dbInst.name}-seed.iso`),
+              pidFile: path.join(PIDS_DIR, `${dbInst.name}.pid`),
+              logFile: path.join(LOGS_DIR, `${dbInst.name}.log`),
+              instanceType: dbInst.instance_type || "VPS",
+              createdAt: new Date().toISOString(),
+            };
+            await QemuVpsService.writeConfigFile(synthConf).catch(() => {});
+            conf = synthConf;
+          }
         }
-        await this.runVirsh(["start", vmName]).catch(() => {});
-        return "running";
+
+        let startedViaQemu = false;
+        if (conf && conf.name) {
+          try {
+            await QemuVpsService.bootVm(conf as VmConfig);
+            startedViaQemu = true;
+            console.log(
+              `[HVM-Power] VM '${vmName}' successfully booted with QEMU (PID: ${await QemuVpsService.getVmPid(
+                vmName
+              )})`
+            );
+          } catch (qemuErr: any) {
+            console.warn(`[HVM-Power] QEMU direct boot note for '${vmName}': ${qemuErr.message}`);
+          }
+        }
+
+        if (!startedViaQemu) {
+          try {
+            await this.runVirsh(["start", vmName]);
+            console.log(`[HVM-Power] Domain '${vmName}' started with virsh`);
+          } catch (virshErr: any) {
+            console.warn(`[HVM-Power] Virsh start note for '${vmName}': ${virshErr.message}`);
+          }
+        }
+
+        const currentStatus = await this.getDomainStatus(vmName);
+        return currentStatus === "running" ? "running" : "stopped";
       }
       case "stop": {
         await QemuVpsService.stopVm(vmName, false);
@@ -1364,12 +1430,8 @@ ${vcpuPinLines}
       }
       case "reboot": {
         await QemuVpsService.stopVm(vmName, false);
-        const conf = await QemuVpsService.readConfigFile(vmName);
-        if (conf && conf.name) {
-          await QemuVpsService.bootVm(conf as VmConfig).catch(() => {});
-        }
         await this.runVirsh(["reboot", vmName]).catch(() => {});
-        return "running";
+        return await this.powerAction(vmName, "start");
       }
     }
   }

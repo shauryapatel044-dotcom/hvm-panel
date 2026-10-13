@@ -526,22 +526,55 @@ CREATED_AT="${conf.createdAt || new Date().toISOString()}"
     const pidFile = conf.pidFile || path.join(PIDS_DIR, `${conf.name}.pid`);
     const logFile = conf.logFile || path.join(LOGS_DIR, `${conf.name}.log`);
 
+    await fs.mkdir(path.dirname(pidFile), { recursive: true }).catch(() => {});
+    await fs.mkdir(path.dirname(logFile), { recursive: true }).catch(() => {});
+
     // Remove any stale pid file
     await fs.unlink(pidFile).catch(() => {});
+
+    // Verify disk path exists or locate fallback candidate
+    let actualDiskPath = conf.diskPath;
+    if (!actualDiskPath || !fsSync.existsSync(actualDiskPath)) {
+      const candidates = [
+        path.join(DISKS_DIR, `${conf.name}.qcow2`),
+        path.join(DISKS_DIR, `${conf.name}.img`),
+        path.join(BASE_DIR, "disks", `${conf.name}.qcow2`),
+        `/var/lib/hvm-vps/disks/${conf.name}.qcow2`,
+        `/var/lib/libvirt/images/hvm/${conf.name}.qcow2`,
+      ];
+      for (const cand of candidates) {
+        if (fsSync.existsSync(cand)) {
+          actualDiskPath = cand;
+          conf.diskPath = cand;
+          break;
+        }
+      }
+    }
 
     const hasKvm = this.hasKvmAcceleration();
     const kvmArgs = hasKvm ? ["-enable-kvm", "-cpu", "host"] : ["-cpu", "qemu64"];
 
-    const qemuArgs = [
+    const qemuArgs: string[] = [
       ...kvmArgs,
       "-m",
       String(conf.ramMb),
       "-smp",
       String(conf.vcpus),
       "-drive",
-      `file=${conf.diskPath},format=qcow2,if=virtio`,
-      "-drive",
-      `file=${conf.seedIso},format=raw,if=virtio,media=cdrom`,
+      `file=${actualDiskPath},format=qcow2,if=virtio`,
+    ];
+
+    // Safely attach cloud-init seed ISO via -cdrom if present
+    const candidateSeed =
+      conf.seedIso && fsSync.existsSync(conf.seedIso)
+        ? conf.seedIso
+        : path.join(SEEDS_DIR, `${conf.name}-seed.iso`);
+    if (fsSync.existsSync(candidateSeed)) {
+      conf.seedIso = candidateSeed;
+      qemuArgs.push("-cdrom", candidateSeed);
+    }
+
+    qemuArgs.push(
       "-netdev",
       `user,id=net0,hostfwd=tcp::${conf.sshPort}-:22`,
       "-device",
@@ -551,8 +584,8 @@ CREATED_AT="${conf.createdAt || new Date().toISOString()}"
       `file:${logFile}`,
       "-daemonize",
       "-pidfile",
-      pidFile,
-    ];
+      pidFile
+    );
 
     if (process.platform === "win32") {
       // Development mode on Windows
@@ -561,12 +594,20 @@ CREATED_AT="${conf.createdAt || new Date().toISOString()}"
       return fakePid;
     }
 
-    // If VDS has pinned CPU cores, execute with taskset
-    if (conf.instanceType === "VDS" && conf.pinnedCores && conf.pinnedCores.length > 0) {
-      const coreMask = conf.pinnedCores.join(",");
-      await execFileAsync("taskset", ["-c", coreMask, "qemu-system-x86_64", ...qemuArgs]);
-    } else {
-      await execFileAsync("qemu-system-x86_64", qemuArgs);
+    try {
+      // If VDS has pinned CPU cores, execute with taskset
+      if (conf.instanceType === "VDS" && conf.pinnedCores && conf.pinnedCores.length > 0) {
+        const coreMask = conf.pinnedCores.join(",");
+        await execFileAsync("taskset", ["-c", coreMask, "qemu-system-x86_64", ...qemuArgs]);
+      } else {
+        await execFileAsync("qemu-system-x86_64", qemuArgs);
+      }
+    } catch (execErr: any) {
+      console.error(
+        `[HVM-QEMU] qemu-system-x86_64 boot error for '${conf.name}':`,
+        execErr.stderr || execErr.message
+      );
+      throw new Error(`QEMU boot failed: ${execErr.stderr || execErr.message}`);
     }
 
     // Wait a brief moment for daemonization and verify PID
@@ -574,7 +615,11 @@ CREATED_AT="${conf.createdAt || new Date().toISOString()}"
 
     const newPid = await this.getVmPid(conf.name);
     if (!newPid) {
-      throw new Error(`Failed to boot VM '${conf.name}'. Inspect log at ${logFile}`);
+      let logSnippet = "";
+      try {
+        logSnippet = (await fs.readFile(logFile, "utf-8")).slice(-500);
+      } catch {}
+      throw new Error(`Failed to boot VM '${conf.name}'. ${logSnippet || "No serial log output"}`);
     }
     return newPid;
   }

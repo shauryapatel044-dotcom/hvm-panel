@@ -515,12 +515,17 @@ start_vm() {
   local pid_file="${PIDS_DIR}/${target_vm}.pid"
   local log_file="${LOGS_DIR}/${target_vm}.log"
 
+  local cdrom_args=()
+  if [[ -n "${SEED_ISO:-}" && -f "${SEED_ISO}" ]]; then
+    cdrom_args=("-cdrom" "${SEED_ISO}")
+  fi
+
   nohup qemu-system-x86_64 \
     "${kvm_flag[@]}" \
     -m "${RAM_MB}" \
     -smp "${VCPUS}" \
     -drive "file=${DISK_PATH},format=qcow2,if=virtio" \
-    -drive "file=${SEED_ISO},format=raw,if=virtio,media=cdrom" \
+    "${cdrom_args[@]}" \
     -netdev "user,id=net0,hostfwd=tcp::${SSH_PORT}-:22" \
     -device "virtio-net-pci,netdev=net0" \
     -nographic \
