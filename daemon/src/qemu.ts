@@ -161,6 +161,7 @@ export interface VmConfig {
   instanceType: "VPS" | "VDS";
   pinnedCores?: number[];
   createdAt?: string;
+  virtType?: "kvm" | "qemu";
 }
 
 export interface SshxProcessSession {
@@ -386,6 +387,7 @@ SEED_ISO="${conf.seedIso}"
 PID_FILE="${conf.pidFile}"
 LOG_FILE="${conf.logFile}"
 INSTANCE_TYPE="${conf.instanceType}"
+VIRT_TYPE="${conf.virtType || 'kvm'}"
 PINNED_CORES="${conf.pinnedCores ? conf.pinnedCores.join(",") : ""}"
 CREATED_AT="${conf.createdAt || new Date().toISOString()}"
 `;
@@ -428,6 +430,7 @@ CREATED_AT="${conf.createdAt || new Date().toISOString()}"
         pidFile: result.PID_FILE || path.join(PIDS_DIR, `${name}.pid`),
         logFile: result.LOG_FILE || path.join(LOGS_DIR, `${name}.log`),
         instanceType: (result.INSTANCE_TYPE as "VPS" | "VDS") || "VPS",
+        virtType: (result.VIRT_TYPE as "kvm" | "qemu") || "kvm",
         createdAt: result.CREATED_AT,
       };
     } catch {
@@ -551,8 +554,11 @@ CREATED_AT="${conf.createdAt || new Date().toISOString()}"
       }
     }
 
-    const hasKvm = this.hasKvmAcceleration();
-    const kvmArgs = hasKvm ? ["-enable-kvm", "-cpu", "host"] : ["-cpu", "qemu64"];
+    const hasHostKvm = this.hasKvmAcceleration();
+    const useKvm = conf.virtType !== "qemu" && hasHostKvm;
+    const kvmArgs = useKvm
+      ? ["-enable-kvm", "-cpu", "host"]
+      : ["-accel", "tcg,thread=multi", "-cpu", "qemu64"];
 
     const qemuArgs: string[] = [
       ...kvmArgs,

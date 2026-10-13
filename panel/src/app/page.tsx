@@ -80,6 +80,8 @@ interface InstanceInfo {
   boot_progress?: number;
   sshx_url?: string | null;
   tailscale_url?: string | null;
+  virt_type?: "kvm" | "qemu";
+  has_host_kvm?: boolean;
 }
 
 interface CoreMetric {
@@ -190,6 +192,7 @@ export default function HVMDashboard() {
     ip_address: "",
     ipv6_address: "",
     user_id: "",
+    virt_type: "kvm" as "kvm" | "qemu",
   });
 
   // Pure QEMU/KVM VPS Engine Modals State (Show Info, Edit Config, Resize Disk, Performance)
@@ -1447,9 +1450,18 @@ export default function HVMDashboard() {
                             </div>
 
                             <div className="flex flex-col items-end space-y-1">
-                              <span className="text-[10px] font-bold px-2.5 py-0.5 rounded-full border border-white/25 bg-white/10 text-white backdrop-blur-md">
-                                {vm.instance_type === "VDS" ? "VDS • DEDICATED" : "VPS • SHARED"}
-                              </span>
+                              <div className="flex items-center space-x-1.5">
+                                <span className={`text-[9px] font-bold px-2 py-0.5 rounded-full border ${
+                                  vm.virt_type === "qemu" || vm.has_host_kvm === false
+                                    ? "border-amber-400/30 bg-amber-500/10 text-amber-300"
+                                    : "border-white/20 bg-white/5 text-zinc-300"
+                                }`}>
+                                  {vm.virt_type === "qemu" || vm.has_host_kvm === false ? "NON-KVM" : "KVM"}
+                                </span>
+                                <span className="text-[10px] font-bold px-2.5 py-0.5 rounded-full border border-white/25 bg-white/10 text-white backdrop-blur-md">
+                                  {vm.instance_type === "VDS" ? "VDS • DEDICATED" : "VPS • SHARED"}
+                                </span>
+                              </div>
                               <span className="text-[10px] font-mono font-bold px-2.5 py-0.5 rounded-full border border-white/25 bg-white/15 text-white flex items-center space-x-1">
                                 {isBooting ? (
                                   <>
@@ -3186,6 +3198,37 @@ export default function HVMDashboard() {
                       : "VDS (Pinned CPU / Locked RAM)"}
                   </button>
                 ))}
+              </div>
+
+              {/* Virtualization Acceleration: KVM vs Non-KVM */}
+              <div className="space-y-1">
+                <label className="block text-xs font-semibold text-zinc-300">
+                  Virtualization Acceleration Engine
+                </label>
+                <div className="grid grid-cols-2 gap-3 p-1.5 glass-sub rounded-2xl">
+                  <button
+                    type="button"
+                    onClick={() => setVmForm({ ...vmForm, virt_type: "kvm" })}
+                    className={`py-2.5 px-3 rounded-xl text-xs font-bold transition ${
+                      vmForm.virt_type === "kvm"
+                        ? "glass-btn-primary"
+                        : "text-zinc-400 hover:text-white"
+                    }`}
+                  >
+                    ⚡ KVM Hardware Acceleration
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setVmForm({ ...vmForm, virt_type: "qemu" })}
+                    className={`py-2.5 px-3 rounded-xl text-xs font-bold transition ${
+                      vmForm.virt_type === "qemu"
+                        ? "glass-btn-primary"
+                        : "text-zinc-400 hover:text-white"
+                    }`}
+                  >
+                    🌐 Non-KVM / QEMU TCG (Universal)
+                  </button>
+                </div>
               </div>
 
               {/* Name, Hostname, Root Password */}

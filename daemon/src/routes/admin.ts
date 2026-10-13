@@ -5,6 +5,7 @@ import mysql from "mysql2/promise";
 import { pool } from "../db";
 import { requireAuth, requireAdmin } from "../middleware/auth";
 import { LibvirtService, IMAGES_DIR, InstanceType } from "../libvirt";
+import { QemuVpsService } from "../qemu";
 
 const router = Router();
 
@@ -157,6 +158,11 @@ router.post("/instances", async (req: Request, res: Response) => {
       assignedIp = trimmedIp || `192.168.122.${Math.floor(Math.random() * 220) + 20}`;
     }
 
+    const hasHostKvm = QemuVpsService.hasKvmAcceleration();
+    const requestedVirt = req.body.virt_type;
+    const virtType: "kvm" | "qemu" =
+      requestedVirt === "qemu" || requestedVirt === "non-kvm" || !hasHostKvm ? "qemu" : "kvm";
+
     const initialStatus: "running" | "stopped" = "running";
     const domainSpec = {
       uuid: vmUuid,
@@ -176,6 +182,7 @@ router.post("/instances", async (req: Request, res: Response) => {
       natPort: assignedNatPort,
       vncPort,
       networkMode: netMode,
+      virtType,
     };
 
     try {

@@ -405,6 +405,26 @@ create_vm() {
     fi
   done
 
+  # 10. Virtualization Engine Mode (KVM vs Non-KVM / TCG)
+  local virt_mode="kvm"
+  if [[ -w /dev/kvm ]]; then
+    echo -e "${C_CYAN}Virtualization Engine Mode:${C_RESET}"
+    echo -e "  ${C_BOLD}1)${C_RESET} KVM Hardware Acceleration (Recommended, near native speed)"
+    echo -e "  ${C_BOLD}2)${C_RESET} Non-KVM / QEMU TCG Software Emulation (Universal, runs on any VPS)"
+    read -r -p "Select Mode [1/2, default: 1]: " virt_choice
+    virt_choice="${virt_choice:-1}"
+    if [[ "${virt_choice}" == "2" ]]; then
+      virt_mode="qemu"
+      log_info "Selected Non-KVM (QEMU TCG Multi-Threaded Emulation) Mode."
+    else
+      virt_mode="kvm"
+      log_info "Selected KVM Hardware Acceleration Mode."
+    fi
+  else
+    virt_mode="qemu"
+    log_info "Host lacks /dev/kvm. Defaulting to Non-KVM (QEMU TCG Multi-Threaded Emulation) Mode."
+  fi
+
   # ----------------------------------------------------------------------------
   # Provisioning Steps
   # ----------------------------------------------------------------------------
@@ -451,6 +471,7 @@ DISK_SIZE="${disk_size}"
 SSH_PORT="${ssh_port}"
 DISK_PATH="${disk_path}"
 SEED_ISO="${seed_iso}"
+VIRT_MODE="${virt_mode}"
 CREATED_AT="$(date '+%Y-%m-%d %H:%M:%S')"
 EOF
   chmod 600 "${conf_file}"
@@ -503,13 +524,13 @@ start_vm() {
     return 0
   fi
 
-  log_info "Booting VM '${target_vm}' in background with QEMU/KVM..."
-
   local kvm_flag=()
-  if [[ -w /dev/kvm ]]; then
+  if [[ "${VIRT_MODE:-kvm}" == "kvm" && -w /dev/kvm ]]; then
+    log_info "Booting VM '${target_vm}' in background with KVM Hardware Acceleration..."
     kvm_flag=("-enable-kvm" "-cpu" "host")
   else
-    kvm_flag=("-cpu" "qemu64")
+    log_info "Booting VM '${target_vm}' in background with Non-KVM / QEMU TCG Multi-Threaded Emulation..."
+    kvm_flag=("-accel" "tcg,thread=multi" "-cpu" "qemu64")
   fi
 
   local pid_file="${PIDS_DIR}/${target_vm}.pid"
@@ -694,6 +715,7 @@ show_vm_info() {
   echo -e "  • Virtual Disk Size  : ${DISK_SIZE}"
   echo -e "  • Host SSH Port      : ${C_BOLD}${SSH_PORT}${C_RESET}"
   echo -e "  • Process PID        : ${pid_str}"
+  echo -e "  • Virtualization Mode: ${VIRT_MODE:-kvm}"
   echo -e "  • Provisioned On     : ${CREATED_AT:-Unknown}"
   echo -e "${C_CYAN}──────────────────────────────────────────────────────────────────────${C_RESET}"
   echo -e "  ${C_BOLD}Access Credentials:${C_RESET}"

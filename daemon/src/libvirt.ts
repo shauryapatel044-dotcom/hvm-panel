@@ -152,6 +152,7 @@ export interface DomainSpec {
   natPort?: number | null;
   vncPort?: number;
   networkMode?: string;
+  virtType?: "kvm" | "qemu";
 }
 
 export class LibvirtService {
@@ -780,6 +781,7 @@ fi
       logFile: path.join(LOGS_DIR, `${spec.name}.log`),
       instanceType: spec.instanceType,
       pinnedCores: spec.pinnedCores,
+      virtType: spec.virtType || (QemuVpsService.hasKvmAcceleration() ? "kvm" : "qemu"),
       createdAt: new Date().toISOString(),
     };
     await QemuVpsService.writeConfigFile(vmConf);
@@ -823,8 +825,9 @@ fi
     </disk>`;
     }
 
-    const hasKvm = QemuVpsService.hasKvmAcceleration();
-    const domainType = hasKvm ? "kvm" : "qemu";
+    const hasHostKvm = QemuVpsService.hasKvmAcceleration();
+    const useKvm = spec.virtType !== "qemu" && hasHostKvm;
+    const domainType = useKvm ? "kvm" : "qemu";
 
     let cpuAndMemoryXml = "";
     let memBalloonXml = "";
@@ -839,7 +842,7 @@ fi
         .map((hostCore, idx) => `    <vcpupin vcpu='${idx}' cpuset='${hostCore}'/>`)
         .join("\n");
 
-      const cpuXml = hasKvm
+      const cpuXml = useKvm
         ? `  <cpu mode='host-passthrough' check='none' migratable='off'>
     <topology sockets='1' dies='1' cores='${spec.vcpus}' threads='1'/>
     <cache mode='passthrough'/>
@@ -866,7 +869,7 @@ ${cpuXml}`;
       memBalloonXml = `<memballoon model='none'/>`;
     } else {
       const cpuShares = spec.vcpus * 1024;
-      const cpuXml = hasKvm
+      const cpuXml = useKvm
         ? `<cpu mode='host-model' check='partial'/>`
         : `<cpu mode='custom' match='exact'><model fallback='allow'>qemu64</model></cpu>`;
       cpuAndMemoryXml = `

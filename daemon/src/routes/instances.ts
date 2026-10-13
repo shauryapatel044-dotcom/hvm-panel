@@ -339,12 +339,18 @@ router.get("/", async (req: Request, res: Response) => {
         LibvirtService.ensureSshxSession(inst).catch(() => {});
       }
 
+      const conf = await QemuVpsService.readConfigFile(inst.name);
+      const hasHostKvm = QemuVpsService.hasKvmAcceleration();
+      const virtType = conf?.virtType || (hasHostKvm ? "kvm" : "qemu");
+
       enriched.push({
         ...inst,
         status: bootState.effectiveStatus,
         boot_progress: bootState.bootProgress,
         sshx_url: bootState.isStarted ? LibvirtService.getSshxUrl(inst) : null,
         tailscale_url: bootState.isStarted ? LibvirtService.getTailscaleUrl(inst) : null,
+        virt_type: virtType,
+        has_host_kvm: hasHostKvm,
       });
     }
 
