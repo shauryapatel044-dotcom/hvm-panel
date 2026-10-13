@@ -20,14 +20,31 @@ echo "=================================================================="
 
 # 1. Pull latest git code if executed in git workspace
 if [[ -d "${SCRIPT_DIR}/.git" ]]; then
-  echo "[1/4] Pulling latest updates from GitHub..."
+  echo "[1/5] Pulling latest updates from GitHub..."
   cd "${SCRIPT_DIR}"
   git fetch origin main || true
   git reset --hard origin/main || true
 fi
 
-# 2. Sync daemon source code & rebuild TypeScript
-echo "[2/4] Updating backend daemon at ${DAEMON_DIR}..."
+# 2. Install hopingboyz detect-server.sh and vm.sh system scripts
+echo "[2/5] Installing server detector and VM management scripts..."
+mkdir -p /root/vms /var/lib/hvm-vps/configs /var/lib/hvm-vps/disks /var/lib/hvm-vps/seeds /var/lib/hvm-vps/pids /var/lib/hvm-vps/logs
+if [[ -f "${SCRIPT_DIR}/scripts/detect-server.sh" ]]; then
+  chmod +x "${SCRIPT_DIR}/scripts/detect-server.sh"
+  cp -f "${SCRIPT_DIR}/scripts/detect-server.sh" /usr/local/bin/hvm-detect-server
+  cp -f "${SCRIPT_DIR}/scripts/detect-server.sh" /usr/local/bin/detect-server.sh
+  chmod +x /usr/local/bin/hvm-detect-server /usr/local/bin/detect-server.sh 2>/dev/null || true
+fi
+if [[ -f "${SCRIPT_DIR}/scripts/vm.sh" ]]; then
+  chmod +x "${SCRIPT_DIR}/scripts/vm.sh"
+  cp -f "${SCRIPT_DIR}/scripts/vm.sh" /usr/local/bin/vm.sh
+  cp -f "${SCRIPT_DIR}/scripts/vm.sh" /usr/local/bin/hvm-vm
+  cp -f "${SCRIPT_DIR}/scripts/vm.sh" /root/vms/vm.sh
+  chmod +x /usr/local/bin/vm.sh /usr/local/bin/hvm-vm /root/vms/vm.sh 2>/dev/null || true
+fi
+
+# 3. Sync daemon source code & rebuild TypeScript
+echo "[3/5] Updating backend daemon at ${DAEMON_DIR}..."
 mkdir -p "${DAEMON_DIR}/src"
 cp -rf "${SCRIPT_DIR}/daemon/src/." "${DAEMON_DIR}/src/"
 cp -f "${SCRIPT_DIR}/daemon/package.json" "${DAEMON_DIR}/" 2>/dev/null || true
@@ -39,9 +56,9 @@ if [[ ! -d "node_modules" ]]; then
 fi
 npm run build
 
-# 3. Sync panel source code if present
+# 4. Sync panel source code if present
 if [[ -d "${PANEL_DIR}" && -d "${SCRIPT_DIR}/panel" ]]; then
-  echo "[3/4] Updating frontend panel at ${PANEL_DIR}..."
+  echo "[4/5] Updating frontend panel at ${PANEL_DIR}..."
   cp -rf "${SCRIPT_DIR}/panel/src/." "${PANEL_DIR}/src/" 2>/dev/null || true
   cp -f "${SCRIPT_DIR}/panel/package.json" "${PANEL_DIR}/" 2>/dev/null || true
   cd "${PANEL_DIR}"
@@ -51,8 +68,8 @@ if [[ -d "${PANEL_DIR}" && -d "${SCRIPT_DIR}/panel" ]]; then
   npm run build
 fi
 
-# 4. Restart services
-echo "[4/4] Restarting HVM daemon and panel services..."
+# 5. Restart services
+echo "[5/5] Restarting HVM daemon and panel services..."
 if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
   systemctl daemon-reload
   systemctl restart hvm-daemon || true

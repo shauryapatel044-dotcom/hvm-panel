@@ -176,6 +176,34 @@ export default function HVMDashboard() {
   const [hostMetrics, setHostMetrics] = useState<HostRealtimeMetric | null>(null);
   const [instanceMetrics, setInstanceMetrics] = useState<Record<number, InstanceRealtimeMetric>>({});
 
+  // Server Environment & Virtualization Detector State (detect-server.sh)
+  const [envInfo, setEnvInfo] = useState<{
+    hostname: string;
+    os: string;
+    kernel: string;
+    cpuModel: string;
+    cpuCores: number;
+    ram: string;
+    disk: string;
+    virt: string;
+    serverType: string;
+    machineType: string;
+    productName: string;
+    sysVendor: string;
+    boardName: string;
+    hypervisorDetected: boolean;
+    score: number;
+    assessment: string;
+    resultText: string;
+    hasKvm: boolean;
+    recommendedEngine: string;
+    rawOutput: string;
+    detectedAt: string;
+  } | null>(null);
+  const [showEnvModal, setShowEnvModal] = useState(false);
+  const [detectingEnv, setDetectingEnv] = useState(false);
+  const [syncingVms, setSyncingVms] = useState(false);
+
   // Admin Provision Modal State (VPS Name, Hostname, Root Password, OS Image, IPv4/IPv6/NAT Auto-Port, SSH Port)
   const [showProvisionModal, setShowProvisionModal] = useState(false);
   const [vmForm, setVmForm] = useState({
@@ -187,6 +215,8 @@ export default function HVMDashboard() {
     ram_mb: 2048,
     disk_gb: 20,
     ssh_port: 2222,
+    port_forwards: "",
+    gui_mode: false,
     os_image: "ubuntu-24.04-server-cloudimg-amd64.qcow2",
     network_mode: "ipv4" as "ipv4" | "ipv6_only" | "dual_stack" | "nat" | "none",
     ip_address: "",
@@ -206,6 +236,8 @@ export default function HVMDashboard() {
     vcpus: 2,
     ssh_port: 2222,
     password: "",
+    port_forwards: "",
+    gui_mode: false,
   });
   const [savingEdit, setSavingEdit] = useState<boolean>(false);
 
@@ -339,14 +371,44 @@ export default function HVMDashboard() {
     }
   };
 
+  const handleDetectEnvironment = async (force = true) => {
+    setDetectingEnv(true);
+    try {
+      const data = await apiFetch("/system/environment/detect", { method: "POST" });
+      setEnvInfo(data);
+      if (!data.hasKvm) {
+        setVmForm((prev) => ({ ...prev, virt_type: "qemu" }));
+      }
+      notify("ok", `Host Environment: ${data.resultText} (Score: ${data.score})`);
+    } catch (err: any) {
+      notify("err", err.message);
+    } finally {
+      setDetectingEnv(false);
+    }
+  };
+
+  const handleSyncVms = async () => {
+    setSyncingVms(true);
+    try {
+      const res = await apiFetch("/instances/sync-external", { method: "POST" });
+      notify("ok", res.message || "Synced VMs from vm.sh");
+      await loadData();
+    } catch (err: any) {
+      notify("err", err.message);
+    } finally {
+      setSyncingVms(false);
+    }
+  };
+
   const loadData = useCallback(async () => {
     if (!token) return;
     setLoading(true);
     try {
-      const [vmData, osData, metricsData] = await Promise.all([
+      const [vmData, osData, metricsData, environmentData] = await Promise.all([
         apiFetch("/instances"),
         apiFetch("/instances/os-images").catch(() => DEFAULT_OS_CATALOG),
         apiFetch("/instances/metrics").catch(() => null),
+        apiFetch("/system/environment").catch(() => null),
       ]);
       if (Array.isArray(vmData)) {
         setInstances(vmData);
@@ -366,6 +428,12 @@ export default function HVMDashboard() {
       if (metricsData) {
         setHostMetrics(metricsData.host || null);
         setInstanceMetrics(metricsData.instances || {});
+      }
+      if (environmentData) {
+        setEnvInfo(environmentData);
+        if (!environmentData.hasKvm) {
+          setVmForm((prev) => ({ ...prev, virt_type: "qemu" }));
+        }
       }
       if (user?.role === "admin") {
         const uData = await apiFetch("/admin/users");
@@ -795,6 +863,8 @@ export default function HVMDashboard() {
       vcpus: vm.vcpus,
       ssh_port: vm.nat_port || 2222,
       password: vm.root_password || "",
+      port_forwards: (vm as any).port_forwards || "",
+      gui_mode: Boolean((vm as any).gui_mode),
     });
   };
 
@@ -1170,7 +1240,41 @@ export default function HVMDashboard() {
             </nav>
           </div>
 
-          <div className="flex items-center space-x-3">
+          <div className="flex items-center space-x-2.5">
+            {/* Host Virtualization & Server Environment Pill (detect-server.sh) */}
+            <motion.button
+              whileHover={{ scale: 1.03 }}
+              whileTap={{ scale: 0.97 }}
+              type="button"
+              onClick={() => setShowEnvModal(true)}
+              className="flex items-center space-x-2 px-3 py-2 rounded-xl glass-btn text-xs font-mono"
+              title="Click to view host server environment & virtualization detection (detect-server.sh)"
+            >
+              <span
+                className={`w-2 h-2 rounded-full ${
+                  envInfo?.hasKvm ? "bg-emerald-400 animate-pulse" : "bg-amber-400"
+                }`}
+              />
+              <span className="font-semibold text-[11px] text-zinc-200">
+                {envInfo
+                  ? `${envInfo.serverType} • ${envInfo.hasKvm ? "KVM ACCELERATED" : "TCG EMULATION"}`
+                  : "DETECTING SERVER..."}
+              </span>
+            </motion.button>
+
+            <motion.button
+              whileHover={{ scale: 1.05 }}
+              whileTap={{ scale: 0.95 }}
+              type="button"
+              onClick={handleSyncVms}
+              disabled={syncingVms}
+              className="flex items-center space-x-1.5 p-2.5 rounded-xl glass-btn text-xs font-semibold"
+              title="Scan and import VMs created via CLI vm.sh script"
+            >
+              <RotateCw className={`w-4 h-4 ${syncingVms ? "animate-spin" : ""}`} />
+              <span className="hidden sm:inline">Sync vm.sh</span>
+            </motion.button>
+
             <motion.button
               whileHover={{ scale: 1.05 }}
               whileTap={{ scale: 0.95 }}
@@ -3425,6 +3529,39 @@ export default function HVMDashboard() {
                 </div>
               </div>
 
+              {/* Additional Port Forwards & GUI Mode (hopingboyz vm.sh parameters) */}
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 pt-1 border-t border-white/10">
+                <div className="sm:col-span-2">
+                  <label className="block text-xs text-zinc-300 mb-1">
+                    Additional Port Forwards (vm.sh format: e.g. <code>8080:80, 443:443</code>)
+                  </label>
+                  <input
+                    placeholder="8080:80, 3000:3000 (optional)"
+                    value={vmForm.port_forwards}
+                    onChange={(e) => setVmForm({ ...vmForm, port_forwards: e.target.value })}
+                    className="w-full glass-input rounded-xl px-3 py-2 text-sm font-mono"
+                  />
+                  <span className="text-[10px] text-zinc-400 mt-1 block">
+                    Comma-separated list of host:guest ports forwarded via QEMU user networking.
+                  </span>
+                </div>
+                <div>
+                  <label className="block text-xs text-zinc-300 mb-1">Display Mode</label>
+                  <button
+                    type="button"
+                    onClick={() => setVmForm({ ...vmForm, gui_mode: !vmForm.gui_mode })}
+                    className={`w-full py-2.5 px-3 rounded-xl text-xs font-semibold transition ${
+                      vmForm.gui_mode ? "glass-btn-primary" : "glass-btn"
+                    }`}
+                  >
+                    {vmForm.gui_mode ? "🖥️ GUI Mode Enabled" : "⚡ Headless (Default)"}
+                  </button>
+                  <span className="text-[10px] text-zinc-400 mt-1 block">
+                    Headless runs in background with VNC + Serial output.
+                  </span>
+                </div>
+              </div>
+
               <div className="flex justify-end space-x-3 pt-2">
                 <button
                   type="button"
@@ -4126,6 +4263,155 @@ export default function HVMDashboard() {
                 <button
                   type="button"
                   onClick={() => setPerfModalVm(null)}
+                  className="px-5 py-2 rounded-xl glass-btn-primary text-xs font-bold"
+                >
+                  Close
+                </button>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* ===================================================================== */}
+      {/* MODAL 10: HOST SERVER & VIRTUALIZATION DETECTOR (detect-server.sh)     */}
+      {/* ===================================================================== */}
+      <AnimatePresence>
+        {showEnvModal && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 bg-black/80 backdrop-blur-md flex items-center justify-center p-4 z-50"
+          >
+            <motion.div
+              initial={{ scale: 0.94, y: 20, opacity: 0 }}
+              animate={{ scale: 1, y: 0, opacity: 1 }}
+              exit={{ scale: 0.94, y: 20, opacity: 0 }}
+              className="glass-panel rounded-3xl p-6 w-full max-w-2xl space-y-5 border border-white/25 max-h-[92vh] overflow-y-auto"
+            >
+              <div className="flex items-center justify-between border-b border-white/15 pb-3">
+                <div className="flex items-center space-x-2.5">
+                  <div className="p-2.5 rounded-xl bg-white/10 border border-white/20 text-white">
+                    <Server className="w-5 h-5" />
+                  </div>
+                  <div>
+                    <h2 className="text-base font-bold text-white tracking-tight">
+                      Advanced Server Detector v3.0
+                    </h2>
+                    <p className="text-xs text-zinc-400">
+                      Zero-dependency host environment & virtualization analyzer (detect-server.sh)
+                    </p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setShowEnvModal(false)}
+                  className="p-1.5 rounded-xl glass-btn"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+
+              {detectingEnv ? (
+                <div className="p-10 text-center text-xs text-zinc-400 font-mono animate-pulse">
+                  Scanning systemd-detect-virt, DMI registers, and /proc/cpuinfo...
+                </div>
+              ) : envInfo ? (
+                <div className="space-y-4">
+                  {/* Summary Badges Grid */}
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                    <div className="glass-sub rounded-2xl p-3 border border-white/15 space-y-1">
+                      <span className="text-[10px] uppercase font-mono text-zinc-400 block">Server Type</span>
+                      <span className="font-bold text-white text-sm block truncate">{envInfo.serverType}</span>
+                      <span className="text-[10px] text-zinc-400 font-mono">Virt: {envInfo.virt}</span>
+                    </div>
+
+                    <div className="glass-sub rounded-2xl p-3 border border-white/15 space-y-1">
+                      <span className="text-[10px] uppercase font-mono text-zinc-400 block">Assessment</span>
+                      <span className="font-bold text-white text-sm block">{envInfo.assessment}</span>
+                      <span className="text-[10px] text-zinc-400 font-mono">Score: {envInfo.score}/10</span>
+                    </div>
+
+                    <div className="glass-sub rounded-2xl p-3 border border-white/15 space-y-1">
+                      <span className="text-[10px] uppercase font-mono text-zinc-400 block">Machine Type</span>
+                      <span className="font-bold text-white text-sm block">{envInfo.machineType}</span>
+                      <span className="text-[10px] text-zinc-400 font-mono truncate block">{envInfo.sysVendor}</span>
+                    </div>
+
+                    <div className="glass-sub rounded-2xl p-3 border border-white/15 space-y-1">
+                      <span className="text-[10px] uppercase font-mono text-zinc-400 block">KVM Hardware</span>
+                      <span
+                        className={`font-bold text-sm block ${
+                          envInfo.hasKvm ? "text-emerald-400" : "text-amber-400"
+                        }`}
+                      >
+                        {envInfo.hasKvm ? "Enabled (/dev/kvm)" : "Non-KVM (TCG)"}
+                      </span>
+                      <span className="text-[10px] text-zinc-400 font-mono">
+                        {envInfo.recommendedEngine.toUpperCase()} Mode
+                      </span>
+                    </div>
+                  </div>
+
+                  {/* Hardware Specs */}
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs font-mono">
+                    <div className="p-2.5 rounded-xl bg-white/[0.04] border border-white/10">
+                      <span className="text-[10px] text-zinc-400 block">CPU Model</span>
+                      <span className="text-white truncate block text-[11px]">{envInfo.cpuModel}</span>
+                    </div>
+                    <div className="p-2.5 rounded-xl bg-white/[0.04] border border-white/10">
+                      <span className="text-[10px] text-zinc-400 block">CPU Cores</span>
+                      <span className="text-white text-[11px]">{envInfo.cpuCores} Cores Active</span>
+                    </div>
+                    <div className="p-2.5 rounded-xl bg-white/[0.04] border border-white/10">
+                      <span className="text-[10px] text-zinc-400 block">Host RAM</span>
+                      <span className="text-white text-[11px]">{envInfo.ram}</span>
+                    </div>
+                    <div className="p-2.5 rounded-xl bg-white/[0.04] border border-white/10">
+                      <span className="text-[10px] text-zinc-400 block">Root Disk</span>
+                      <span className="text-white text-[11px]">{envInfo.disk}</span>
+                    </div>
+                  </div>
+
+                  {/* Raw ANSI Script Output */}
+                  <div className="space-y-1.5">
+                    <div className="flex items-center justify-between text-xs">
+                      <span className="text-[10px] font-mono uppercase text-zinc-400">
+                        detect-server.sh Console Output:
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => copyText("env-output", envInfo.rawOutput)}
+                        className="text-[11px] text-zinc-300 hover:text-white underline font-mono"
+                      >
+                        {copiedId === "env-output" ? "Copied!" : "Copy Output"}
+                      </button>
+                    </div>
+                    <pre className="p-3.5 rounded-2xl bg-black/80 border border-white/20 font-mono text-xs text-zinc-300 max-h-56 overflow-y-auto whitespace-pre leading-relaxed select-all">
+                      {envInfo.rawOutput}
+                    </pre>
+                  </div>
+                </div>
+              ) : (
+                <div className="p-6 text-center text-xs text-zinc-400 font-mono">
+                  No environment details detected yet. Click Re-run Detector below.
+                </div>
+              )}
+
+              <div className="flex items-center justify-between pt-2">
+                <button
+                  type="button"
+                  onClick={() => handleDetectEnvironment(true)}
+                  disabled={detectingEnv}
+                  className="px-4 py-2 rounded-xl glass-btn text-xs font-semibold flex items-center space-x-1.5"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${detectingEnv ? "animate-spin" : ""}`} />
+                  <span>Re-run Server Detector</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setShowEnvModal(false)}
                   className="px-5 py-2 rounded-xl glass-btn-primary text-xs font-bold"
                 >
                   Close

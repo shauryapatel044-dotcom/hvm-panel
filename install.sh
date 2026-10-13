@@ -196,6 +196,22 @@ npm --prefix "${PANEL_DIR}" run build
 # ------------------------------------------------------------------------------
 echo "[6/7] Starting HVM Daemon (Port ${DAEMON_PORT}) & HVM Panel (Port ${PANEL_PORT})..."
 
+# Install hopingboyz detect-server.sh & vm.sh CLI
+mkdir -p /root/vms /var/lib/hvm-vps/configs /var/lib/hvm-vps/disks /var/lib/hvm-vps/seeds /var/lib/hvm-vps/pids /var/lib/hvm-vps/logs
+if [[ -f "${SCRIPT_DIR}/scripts/detect-server.sh" ]]; then
+  chmod +x "${SCRIPT_DIR}/scripts/detect-server.sh"
+  cp -f "${SCRIPT_DIR}/scripts/detect-server.sh" /usr/local/bin/hvm-detect-server
+  cp -f "${SCRIPT_DIR}/scripts/detect-server.sh" /usr/local/bin/detect-server.sh
+  chmod +x /usr/local/bin/hvm-detect-server /usr/local/bin/detect-server.sh 2>/dev/null || true
+fi
+if [[ -f "${SCRIPT_DIR}/scripts/vm.sh" ]]; then
+  chmod +x "${SCRIPT_DIR}/scripts/vm.sh"
+  cp -f "${SCRIPT_DIR}/scripts/vm.sh" /usr/local/bin/vm.sh
+  cp -f "${SCRIPT_DIR}/scripts/vm.sh" /usr/local/bin/hvm-vm
+  cp -f "${SCRIPT_DIR}/scripts/vm.sh" /root/vms/vm.sh
+  chmod +x /usr/local/bin/vm.sh /usr/local/bin/hvm-vm /root/vms/vm.sh 2>/dev/null || true
+fi
+
 mkdir -p /var/lib/hvm/containers
 pkill -f "sshx -q --shell" 2>/dev/null || true
 

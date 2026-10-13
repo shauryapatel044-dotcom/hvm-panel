@@ -153,6 +153,8 @@ export interface DomainSpec {
   vncPort?: number;
   networkMode?: string;
   virtType?: "kvm" | "qemu";
+  portForwards?: string;
+  guiMode?: boolean;
 }
 
 export class LibvirtService {
@@ -770,6 +772,9 @@ fi
       name: spec.name,
       osKey: cloudImage.id,
       osLabel: cloudImage.label,
+      osType: cloudImage.distro.toLowerCase(),
+      codename: cloudImage.codename,
+      imgUrl: cloudImage.url,
       hostname: spec.hostname,
       username: "root",
       password: spec.rootPassword,
@@ -777,6 +782,8 @@ fi
       vcpus: spec.vcpus,
       diskSize: `${spec.diskGb}G`,
       sshPort,
+      portForwards: spec.portForwards,
+      guiMode: spec.guiMode,
       diskPath,
       seedIso: seedIsoPath,
       pidFile: path.join(PIDS_DIR, `${spec.name}.pid`),

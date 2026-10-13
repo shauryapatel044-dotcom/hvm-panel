@@ -6,6 +6,7 @@ import { LibvirtService } from "./libvirt";
 import authRoutes from "./routes/auth";
 import adminRoutes from "./routes/admin";
 import instanceRoutes from "./routes/instances";
+import systemRoutes from "./routes/system";
 
 dotenv.config();
 
@@ -29,6 +30,7 @@ app.get("/api/health", (_req, res) => {
 app.use("/api/auth", authRoutes);
 app.use("/api/admin", adminRoutes);
 app.use("/api/instances", instanceRoutes);
+app.use("/api/system", systemRoutes);
 
 async function bootstrap() {
   try {

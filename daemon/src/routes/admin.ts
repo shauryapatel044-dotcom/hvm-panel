@@ -183,6 +183,8 @@ router.post("/instances", async (req: Request, res: Response) => {
       vncPort,
       networkMode: netMode,
       virtType,
+      portForwards: req.body.port_forwards ? String(req.body.port_forwards).trim() : "",
+      guiMode: Boolean(req.body.gui_mode),
     };
 
     try {

@@ -7,6 +7,7 @@ import os from "os";
 import net from "net";
 import { DATA_DIR, pool } from "./db";
 import mysql from "mysql2/promise";
+import { v4 as uuidv4 } from "uuid";
 
 const execFileAsync = promisify(execFile);
 
@@ -39,6 +40,7 @@ export interface CloudImageInfo {
   id: string;
   label: string;
   distro: string;
+  codename?: string;
   filename: string;
   url: string;
   kernel: string;
@@ -49,6 +51,7 @@ export const CLOUD_IMAGE_CATALOG: CloudImageInfo[] = [
     id: "ubuntu-24.04",
     label: "Ubuntu 24.04 LTS (Noble Numbat)",
     distro: "Ubuntu",
+    codename: "noble",
     filename: "noble-server-cloudimg-amd64.img",
     url: "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img",
     kernel: "6.8.0-45-generic #45-Ubuntu SMP PREEMPT_DYNAMIC",
@@ -57,6 +60,7 @@ export const CLOUD_IMAGE_CATALOG: CloudImageInfo[] = [
     id: "ubuntu-22.04",
     label: "Ubuntu 22.04 LTS (Jammy Jellyfish)",
     distro: "Ubuntu",
+    codename: "jammy",
     filename: "jammy-server-cloudimg-amd64.img",
     url: "https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img",
     kernel: "5.15.0-119-generic #129-Ubuntu SMP",
@@ -65,6 +69,7 @@ export const CLOUD_IMAGE_CATALOG: CloudImageInfo[] = [
     id: "ubuntu-20.04",
     label: "Ubuntu 20.04 LTS (Focal Fossa)",
     distro: "Ubuntu",
+    codename: "focal",
     filename: "focal-server-cloudimg-amd64.img",
     url: "https://cloud-images.ubuntu.com/focal/current/focal-server-cloudimg-amd64.img",
     kernel: "5.4.0-192-generic #212-Ubuntu SMP",
@@ -73,6 +78,7 @@ export const CLOUD_IMAGE_CATALOG: CloudImageInfo[] = [
     id: "debian-12",
     label: "Debian 12 (Bookworm)",
     distro: "Debian",
+    codename: "bookworm",
     filename: "debian-12-genericcloud-amd64.qcow2",
     url: "https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-amd64.qcow2",
     kernel: "6.1.0-25-amd64 #1 SMP PREEMPT_DYNAMIC",
@@ -81,6 +87,7 @@ export const CLOUD_IMAGE_CATALOG: CloudImageInfo[] = [
     id: "debian-11",
     label: "Debian 11 (Bullseye)",
     distro: "Debian",
+    codename: "bullseye",
     filename: "debian-11-genericcloud-amd64.qcow2",
     url: "https://cloud.debian.org/images/cloud/bullseye/latest/debian-11-genericcloud-amd64.qcow2",
     kernel: "5.10.0-32-amd64 #1 SMP Debian",
@@ -89,6 +96,7 @@ export const CLOUD_IMAGE_CATALOG: CloudImageInfo[] = [
     id: "fedora-40",
     label: "Fedora 40 Cloud Base",
     distro: "Fedora",
+    codename: "40",
     filename: "Fedora-Cloud-Base-Generic.x86_64-40-1.14.qcow2",
     url: "https://download.fedoraproject.org/pub/fedora/linux/releases/40/Cloud/x86_64/images/Fedora-Cloud-Base-Generic.x86_64-40-1.14.qcow2",
     kernel: "6.10.7-200.fc40.x86_64 #1 SMP PREEMPT_DYNAMIC",
@@ -97,6 +105,7 @@ export const CLOUD_IMAGE_CATALOG: CloudImageInfo[] = [
     id: "almalinux-9",
     label: "AlmaLinux 9 (GenericCloud)",
     distro: "AlmaLinux",
+    codename: "9",
     filename: "AlmaLinux-9-GenericCloud-latest.x86_64.qcow2",
     url: "https://repo.almalinux.org/almalinux/9/cloud/x86_64/images/AlmaLinux-9-GenericCloud-latest.x86_64.qcow2",
     kernel: "5.14.0-427.31.1.el9_4.x86_64 #1 SMP PREEMPT_DYNAMIC",
@@ -105,6 +114,7 @@ export const CLOUD_IMAGE_CATALOG: CloudImageInfo[] = [
     id: "rocky-9",
     label: "Rocky Linux 9 (Blue Onyx)",
     distro: "Rocky",
+    codename: "9",
     filename: "Rocky-9-GenericCloud.latest.x86_64.qcow2",
     url: "https://download.rockylinux.org/pub/rocky/9/images/x86_64/Rocky-9-GenericCloud.latest.x86_64.qcow2",
     kernel: "5.14.0-427.31.1.el9_4.x86_64 #1 SMP PREEMPT_DYNAMIC",
@@ -113,6 +123,7 @@ export const CLOUD_IMAGE_CATALOG: CloudImageInfo[] = [
     id: "centos-9",
     label: "CentOS Stream 9",
     distro: "CentOS",
+    codename: "stream9",
     filename: "CentOS-Stream-GenericCloud-9-latest.x86_64.qcow2",
     url: "https://cloud.centos.org/centos/9-stream/x86_64/images/CentOS-Stream-GenericCloud-9-latest.x86_64.qcow2",
     kernel: "5.14.0-427.el9.x86_64 #1 SMP",
@@ -121,6 +132,7 @@ export const CLOUD_IMAGE_CATALOG: CloudImageInfo[] = [
     id: "alpine-3.20",
     label: "Alpine Linux 3.20 (Virtual)",
     distro: "Alpine",
+    codename: "3.20",
     filename: "alpine-virt-3.20.3-x86_64.iso",
     url: "https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86_64/alpine-virt-3.20.3-x86_64.iso",
     kernel: "6.6.48-0-virt #1-Alpine SMP PREEMPT_DYNAMIC",
@@ -135,6 +147,7 @@ export function resolveCloudImage(imageIdentifier?: string): CloudImageInfo {
       c.id.toLowerCase() === query ||
       c.filename.toLowerCase() === query ||
       c.label.toLowerCase().includes(query) ||
+      (c.codename && c.codename.toLowerCase() === query) ||
       query.includes(c.id.toLowerCase())
   );
   return match || CLOUD_IMAGE_CATALOG[0];
@@ -147,6 +160,9 @@ export interface VmConfig {
   name: string;
   osKey: string;
   osLabel: string;
+  osType?: string;
+  codename?: string;
+  imgUrl?: string;
   hostname: string;
   username: string;
   password: string;
@@ -154,6 +170,8 @@ export interface VmConfig {
   vcpus: number;
   diskSize: string; // e.g. "20G"
   sshPort: number;
+  guiMode?: boolean;
+  portForwards?: string; // e.g. "8080:80,443:443"
   diskPath: string;
   seedIso: string;
   pidFile: string;
@@ -408,80 +426,139 @@ runcmd:
   }
 
   /**
-   * Saves local .conf configuration file matching vps-manager.sh format
+   * Saves local .conf configuration file matching hopingboyz vm.sh format
    */
   static async writeConfigFile(conf: VmConfig): Promise<string> {
     await ensureStorageDirectories();
     const confPath = path.join(CONFIGS_DIR, `${conf.name}.conf`);
-    const content = `# HVM VPS Manager Configuration
+
+    const osType = conf.osType || (conf.osKey ? conf.osKey.split("-")[0] : "ubuntu");
+    const codename =
+      conf.codename ||
+      (conf.osKey && conf.osKey.includes("24")
+        ? "noble"
+        : conf.osKey && conf.osKey.includes("22")
+        ? "jammy"
+        : "generic");
+    const portForwards = conf.portForwards || "";
+    const guiModeStr = conf.guiMode ? "true" : "false";
+
+    const content = `# HVM VPS Manager & hopingboyz vm.sh Configuration
 VM_NAME="${conf.name}"
-OS_KEY="${conf.osKey}"
-OS_LABEL="${conf.osLabel}"
+OS_TYPE="${osType}"
+CODENAME="${codename}"
+IMG_URL="${conf.imgUrl || ""}"
 HOSTNAME="${conf.hostname}"
 USERNAME="${conf.username}"
 PASSWORD="${conf.password}"
+DISK_SIZE="${conf.diskSize}"
+MEMORY="${conf.ramMb}"
+CPUS="${conf.vcpus}"
+SSH_PORT="${conf.sshPort}"
+GUI_MODE="${guiModeStr}"
+PORT_FORWARDS="${portForwards}"
+IMG_FILE="${conf.diskPath}"
+SEED_FILE="${conf.seedIso}"
+CREATED="${conf.createdAt || new Date().toISOString()}"
+
+# HVM Extended Parameters
+OS_KEY="${conf.osKey}"
+OS_LABEL="${conf.osLabel}"
 RAM_MB="${conf.ramMb}"
 VCPUS="${conf.vcpus}"
-DISK_SIZE="${conf.diskSize}"
-SSH_PORT="${conf.sshPort}"
 DISK_PATH="${conf.diskPath}"
 SEED_ISO="${conf.seedIso}"
 PID_FILE="${conf.pidFile}"
 LOG_FILE="${conf.logFile}"
 INSTANCE_TYPE="${conf.instanceType}"
-VIRT_TYPE="${conf.virtType || 'kvm'}"
+VIRT_TYPE="${conf.virtType || "kvm"}"
 PINNED_CORES="${conf.pinnedCores ? conf.pinnedCores.join(",") : ""}"
 CREATED_AT="${conf.createdAt || new Date().toISOString()}"
 `;
     await fs.writeFile(confPath, content, { encoding: "utf-8", mode: 0o600 });
+
+    // Sync to /root/vms or $HOME/vms so CLI vm.sh can see it directly!
+    const externalDirs = ["/root/vms", path.join(os.homedir(), "vms")];
+    for (const extDir of externalDirs) {
+      try {
+        await fs.mkdir(extDir, { recursive: true });
+        await fs.writeFile(path.join(extDir, `${conf.name}.conf`), content, {
+          encoding: "utf-8",
+          mode: 0o600,
+        });
+      } catch {}
+    }
+
     return confPath;
   }
 
   /**
-   * Reads .conf configuration file
+   * Reads .conf configuration file (checks HVM configs and external hopingboyz vm.sh directories)
    */
   static async readConfigFile(name: string): Promise<Partial<VmConfig> | null> {
-    const confPath = path.join(CONFIGS_DIR, `${name}.conf`);
-    try {
-      const raw = await fs.readFile(confPath, "utf-8");
-      const result: Record<string, string> = {};
-      for (const line of raw.split("\n")) {
-        const trimmed = line.trim();
-        if (!trimmed || trimmed.startsWith("#")) continue;
-        const eqIdx = trimmed.indexOf("=");
-        if (eqIdx !== -1) {
-          const key = trimmed.slice(0, eqIdx).trim();
-          let val = trimmed.slice(eqIdx + 1).trim();
-          if (val.startsWith('"') && val.endsWith('"')) val = val.slice(1, -1);
-          result[key] = val;
+    const candidatePaths = [
+      path.join(CONFIGS_DIR, `${name}.conf`),
+      `/root/vms/${name}.conf`,
+      path.join(os.homedir(), "vms", `${name}.conf`),
+      `/var/lib/hvm-vps/configs/${name}.conf`,
+    ];
+
+    for (const confPath of candidatePaths) {
+      try {
+        const raw = await fs.readFile(confPath, "utf-8");
+        const result: Record<string, string> = {};
+        for (const line of raw.split("\n")) {
+          const trimmed = line.trim();
+          if (!trimmed || trimmed.startsWith("#")) continue;
+          const eqIdx = trimmed.indexOf("=");
+          if (eqIdx !== -1) {
+            const key = trimmed.slice(0, eqIdx).trim();
+            let val = trimmed.slice(eqIdx + 1).trim();
+            if (val.startsWith('"') && val.endsWith('"')) val = val.slice(1, -1);
+            result[key] = val;
+          }
         }
-      }
-      return {
-        name: result.VM_NAME,
-        osKey: result.OS_KEY,
-        osLabel: result.OS_LABEL,
-        hostname: result.HOSTNAME,
-        username: result.USERNAME || "root",
-        password: result.PASSWORD,
-        ramMb: Number(result.RAM_MB) || 1024,
-        vcpus: Number(result.VCPUS) || 1,
-        diskSize: result.DISK_SIZE || "20G",
-        sshPort: Number(result.SSH_PORT) || 2222,
-        diskPath: result.DISK_PATH,
-        seedIso: result.SEED_ISO,
-        pidFile: result.PID_FILE || path.join(PIDS_DIR, `${name}.pid`),
-        logFile: result.LOG_FILE || path.join(LOGS_DIR, `${name}.log`),
-        instanceType: (result.INSTANCE_TYPE as "VPS" | "VDS") || "VPS",
-        virtType: (result.VIRT_TYPE as "kvm" | "qemu") || "kvm",
-        createdAt: result.CREATED_AT,
-      };
-    } catch {
-      return null;
+
+        const ramMb = Number(result.RAM_MB || result.MEMORY) || 1024;
+        const vcpus = Number(result.VCPUS || result.CPUS) || 1;
+        const diskPath =
+          result.DISK_PATH || result.IMG_FILE || path.join(DISKS_DIR, `${name}.qcow2`);
+        const seedIso =
+          result.SEED_ISO || result.SEED_FILE || path.join(SEEDS_DIR, `${name}-seed.iso`);
+        const portForwards = result.PORT_FORWARDS || "";
+        const guiMode = result.GUI_MODE === "true";
+
+        return {
+          name: result.VM_NAME || name,
+          osKey: result.OS_KEY || `${result.OS_TYPE || "ubuntu"}-${result.CODENAME || "22.04"}`,
+          osLabel: result.OS_LABEL || `${result.OS_TYPE || "Linux"} (${result.CODENAME || "Cloud"})`,
+          osType: result.OS_TYPE,
+          codename: result.CODENAME,
+          imgUrl: result.IMG_URL,
+          hostname: result.HOSTNAME || name,
+          username: result.USERNAME || "root",
+          password: result.PASSWORD,
+          ramMb,
+          vcpus,
+          diskSize: result.DISK_SIZE || "20G",
+          sshPort: Number(result.SSH_PORT) || 2222,
+          guiMode,
+          portForwards,
+          diskPath,
+          seedIso,
+          pidFile: result.PID_FILE || path.join(PIDS_DIR, `${name}.pid`),
+          logFile: result.LOG_FILE || path.join(LOGS_DIR, `${name}.log`),
+          instanceType: (result.INSTANCE_TYPE as "VPS" | "VDS") || "VPS",
+          virtType: (result.VIRT_TYPE as "kvm" | "qemu") || "kvm",
+          createdAt: result.CREATED_AT || result.CREATED,
+        };
+      } catch {}
     }
+    return null;
   }
 
   /**
-   * Checks if VM process is actively running via PID file
+   * Checks if VM process is actively running via PID file or pgrep (matching hopingboyz vm.sh)
    */
   static async isVmRunning(name: string): Promise<boolean> {
     const pidFile = path.join(PIDS_DIR, `${name}.pid`);
@@ -492,10 +569,18 @@ CREATED_AT="${conf.createdAt || new Date().toISOString()}"
         process.kill(pid, 0); // Throws if not running
         return true;
       }
-      return false;
-    } catch {
-      return false;
+    } catch {}
+
+    // Fallback matching hopingboyz-vm.sh: pgrep -f "qemu-system-x86_64.*$name"
+    if (process.platform !== "win32") {
+      try {
+        const { stdout } = await execFileAsync("pgrep", ["-f", `qemu-system-x86_64.*${name}`]);
+        return stdout.trim().length > 0;
+      } catch {
+        return false;
+      }
     }
+    return false;
   }
 
   /**
@@ -510,10 +595,20 @@ CREATED_AT="${conf.createdAt || new Date().toISOString()}"
         process.kill(pid, 0);
         return pid;
       }
-      return null;
-    } catch {
-      return null;
+    } catch {}
+
+    // Fallback matching hopingboyz-vm.sh: pgrep -f "qemu-system-x86_64.*$name"
+    if (process.platform !== "win32") {
+      try {
+        const { stdout } = await execFileAsync("pgrep", ["-f", `qemu-system-x86_64.*${name}`]);
+        const firstPid = parseInt(stdout.trim().split("\n")[0], 10);
+        if (!Number.isNaN(firstPid) && firstPid > 0) {
+          return firstPid;
+        }
+      } catch {}
     }
+
+    return null;
   }
 
   /**
@@ -656,7 +751,7 @@ CREATED_AT="${conf.createdAt || new Date().toISOString()}"
       `file=${actualDiskPath},format=qcow2,if=virtio`,
     ];
 
-    // Safely attach cloud-init seed ISO via -cdrom if present, or generate on the fly
+    // Safely attach cloud-init seed ISO via VirtIO raw drive (matches hopingboyz vm.sh line 376)
     let candidateSeed =
       conf.seedIso && fsSync.existsSync(conf.seedIso)
         ? conf.seedIso
@@ -675,14 +770,50 @@ CREATED_AT="${conf.createdAt || new Date().toISOString()}"
     }
     if (candidateSeed && fsSync.existsSync(candidateSeed)) {
       conf.seedIso = candidateSeed;
-      qemuArgs.push("-cdrom", candidateSeed);
+      // In hopingboyz-vm.sh: -drive "file=$SEED_FILE,format=raw,if=virtio"
+      qemuArgs.push("-drive", `file=${candidateSeed},format=raw,if=virtio`);
     }
 
+    qemuArgs.push("-boot", "order=c");
+
+    // Primary network & SSH port forward
     qemuArgs.push(
-      "-netdev",
-      `user,id=net0,hostfwd=tcp::${conf.sshPort}-:22`,
       "-device",
       "virtio-net-pci,netdev=net0",
+      "-netdev",
+      `user,id=net0,hostfwd=tcp::${conf.sshPort}-:22`
+    );
+
+    // Port forwards from hopingboyz-vm.sh (e.g. 8080:80,443:443)
+    if (conf.portForwards) {
+      const forwards = conf.portForwards.split(",").map((f) => f.trim()).filter(Boolean);
+      forwards.forEach((fwd, idx) => {
+        const parts = fwd.split(":");
+        if (parts.length === 2) {
+          const hPort = parseInt(parts[0], 10);
+          const gPort = parseInt(parts[1], 10);
+          if (hPort > 0 && gPort > 0) {
+            const devId = `fwd${idx + 1}`;
+            qemuArgs.push(
+              "-device",
+              `virtio-net-pci,netdev=${devId}`,
+              "-netdev",
+              `user,id=${devId},hostfwd=tcp::${hPort}-:${gPort}`
+            );
+          }
+        }
+      });
+    }
+
+    // Performance enhancements from hopingboyz-vm.sh:
+    // virtio-balloon and virtio-rng for instantaneous hardware entropy (speeds up cloud-init boot)
+    qemuArgs.push(
+      "-device",
+      "virtio-balloon-pci",
+      "-object",
+      "rng-random,filename=/dev/urandom,id=rng0",
+      "-device",
+      "virtio-rng-pci,rng=rng0",
       "-display",
       "none",
       "-serial",
@@ -764,7 +895,84 @@ CREATED_AT="${conf.createdAt || new Date().toISOString()}"
       }
     }
 
+    // Extra safety matching hopingboyz-vm.sh: pkill -f "qemu-system-x86_64.*$name"
+    if (process.platform !== "win32") {
+      try {
+        await execFileAsync("pkill", ["-f", `qemu-system-x86_64.*${name}`]).catch(() => {});
+      } catch {}
+    }
+
     await fs.unlink(pidFile).catch(() => {});
+  }
+
+  /**
+   * Discovers and syncs any VMs created externally via hopingboyz vm.sh into the HVM database
+   */
+  static async discoverAndSyncExternalVms(): Promise<number> {
+    const candidateDirs = [
+      "/root/vms",
+      path.join(os.homedir(), "vms"),
+      CONFIGS_DIR,
+      "/var/lib/hvm-vps/configs",
+    ];
+
+    let synced = 0;
+    for (const dir of candidateDirs) {
+      try {
+        const files = await fs.readdir(dir);
+        for (const file of files) {
+          if (file.endsWith(".conf")) {
+            const vmName = file.replace(/\.conf$/, "");
+            const conf = await this.readConfigFile(vmName);
+            if (!conf || !conf.name) continue;
+
+            const [existing] = await pool.query<mysql.RowDataPacket[]>(
+              "SELECT id FROM instances WHERE name = ? LIMIT 1",
+              [conf.name]
+            );
+
+            if (existing.length === 0) {
+              const isRunning = await this.isVmRunning(conf.name);
+              const vmUuid = uuidv4();
+              const diskPath = conf.diskPath || path.join(DISKS_DIR, `${conf.name}.qcow2`);
+              const port = conf.sshPort || 2222;
+              const mac =
+                "52:54:00:" +
+                Math.floor(Math.random() * 0x89abcdef)
+                  .toString(16)
+                  .padStart(6, "0")
+                  .match(/../g)!
+                  .join(":");
+
+              await pool.query(
+                `INSERT INTO instances
+                 (uuid, name, hostname, root_password, instance_type, vcpus, ram_mb, disk_gb, disk_path, os_image, network_mode, nat_port, mac_address, status)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                [
+                  vmUuid,
+                  conf.name,
+                  conf.hostname || conf.name,
+                  conf.password || "root",
+                  conf.instanceType || "VPS",
+                  conf.vcpus || 1,
+                  conf.ramMb || 2048,
+                  parseInt(String(conf.diskSize || "20"), 10) || 20,
+                  diskPath,
+                  conf.osKey || "ubuntu-24.04",
+                  "nat",
+                  port,
+                  mac,
+                  isRunning ? "running" : "stopped",
+                ]
+              );
+              synced++;
+              console.log(`[HVM-Sync] Discovered & synced external VM '${conf.name}' from ${dir}/${file}`);
+            }
+          }
+        }
+      } catch {}
+    }
+    return synced;
   }
 
   /**

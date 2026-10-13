@@ -302,9 +302,22 @@ router.get("/os-images", (_req: Request, res: Response) => {
   res.json(AVAILABLE_OS_IMAGES);
 });
 
+// Sync any external VMs created via hopingboyz vm.sh CLI
+router.post("/sync-external", async (_req: Request, res: Response) => {
+  try {
+    const syncedCount = await QemuVpsService.discoverAndSyncExternalVms();
+    res.json({ message: `Synced ${syncedCount} external VM(s) from vm.sh`, synced: syncedCount });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // List instances (Admin sees all instances globally; User sees only instances assigned to them)
 router.get("/", async (req: Request, res: Response) => {
   try {
+    // Automatically discover any newly created VMs from hopingboyz vm.sh
+    await QemuVpsService.discoverAndSyncExternalVms().catch(() => {});
+
     let rows: mysql.RowDataPacket[];
     if (req.user!.role === "admin") {
       const [all] = await pool.query<mysql.RowDataPacket[]>(
@@ -351,6 +364,8 @@ router.get("/", async (req: Request, res: Response) => {
         tailscale_url: bootState.isStarted ? LibvirtService.getTailscaleUrl(inst) : null,
         virt_type: virtType,
         has_host_kvm: hasHostKvm,
+        port_forwards: conf?.portForwards || null,
+        gui_mode: Boolean(conf?.guiMode),
       });
     }
 
@@ -1167,6 +1182,12 @@ router.get("/:id/conf", async (req: Request, res: Response) => {
       ram_mb: conf?.ramMb || inst.ram_mb,
       vcpus: conf?.vcpus || inst.vcpus,
       disk_size: conf?.diskSize || `${inst.disk_gb}G`,
+      port_forwards: conf?.portForwards || "",
+      gui_mode: Boolean(conf?.guiMode),
+      os_type: conf?.osType || "ubuntu",
+      codename: conf?.codename || "noble",
+      img_url: conf?.imgUrl || "",
+      virt_type: conf?.virtType || (QemuVpsService.hasKvmAcceleration() ? "kvm" : "qemu"),
       instance_type: inst.instance_type,
       running: isRunning,
       pid,
@@ -1178,7 +1199,7 @@ router.get("/:id/conf", async (req: Request, res: Response) => {
   }
 });
 
-// [Feature: Edit VM Config] Allows user to change RAM, CPU, SSH port, or password
+// [Feature: Edit VM Config] Allows user to change RAM, CPU, SSH port, password, or port forwards
 // Re-generates cloud-init seed ISO if password or hostname changes
 router.patch("/:id/config", async (req: Request, res: Response) => {
   try {
@@ -1197,13 +1218,15 @@ router.patch("/:id/config", async (req: Request, res: Response) => {
       return;
     }
 
-    const { ram_mb, vcpus, ssh_port, password } = req.body;
+    const { ram_mb, vcpus, ssh_port, password, port_forwards, gui_mode } = req.body;
     const existingConf = (await QemuVpsService.readConfigFile(inst.name)) || {};
 
     const updatedRamMb = ram_mb ? Math.max(512, Number(ram_mb)) : Number(existingConf.ramMb || inst.ram_mb);
     const updatedVcpus = vcpus ? Math.max(1, Number(vcpus)) : Number(existingConf.vcpus || inst.vcpus);
     const updatedSshPort = ssh_port ? Number(ssh_port) : Number(existingConf.sshPort || inst.nat_port || 2222);
     const updatedPassword = password ? String(password).trim() : String(existingConf.password || inst.root_password);
+    const updatedPortForwards = port_forwards !== undefined ? String(port_forwards).trim() : existingConf.portForwards;
+    const updatedGuiMode = gui_mode !== undefined ? Boolean(gui_mode) : existingConf.guiMode;
 
     let seedIso = existingConf.seedIso || inst.seed_iso;
 
@@ -1221,6 +1244,9 @@ router.patch("/:id/config", async (req: Request, res: Response) => {
       name: inst.name,
       osKey: existingConf.osKey || "ubuntu-24.04",
       osLabel: existingConf.osLabel || "Ubuntu 24.04",
+      osType: existingConf.osType,
+      codename: existingConf.codename,
+      imgUrl: existingConf.imgUrl,
       hostname: existingConf.hostname || inst.hostname || inst.name,
       username: existingConf.username || "root",
       password: updatedPassword,
@@ -1228,11 +1254,14 @@ router.patch("/:id/config", async (req: Request, res: Response) => {
       vcpus: updatedVcpus,
       diskSize: existingConf.diskSize || `${inst.disk_gb}G`,
       sshPort: updatedSshPort,
+      portForwards: updatedPortForwards,
+      guiMode: updatedGuiMode,
       diskPath: existingConf.diskPath || inst.disk_path,
       seedIso,
       pidFile: existingConf.pidFile || path.join(DATA_DIR, "vps", "pids", `${inst.name}.pid`),
       logFile: existingConf.logFile || path.join(DATA_DIR, "vps", "logs", `${inst.name}.log`),
       instanceType: inst.instance_type,
+      virtType: existingConf.virtType,
     };
 
     await QemuVpsService.writeConfigFile(updatedConf);

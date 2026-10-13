@@ -513,6 +513,13 @@ export async function initDatabase(): Promise<void> {
       ) ENGINE=InnoDB;
     `);
 
+    await conn.query(`
+      ALTER TABLE instances ADD COLUMN IF NOT EXISTS port_forwards VARCHAR(255) DEFAULT NULL;
+    `).catch(() => {});
+    await conn.query(`
+      ALTER TABLE instances ADD COLUMN IF NOT EXISTS virt_type VARCHAR(32) DEFAULT 'kvm';
+    `).catch(() => {});
+
     const adminUsername = process.env.DEFAULT_ADMIN_USERNAME || "admin";
     const adminEmail = process.env.DEFAULT_ADMIN_EMAIL || "admin@hvm.local";
     const adminPass = process.env.DEFAULT_ADMIN_PASSWORD || "admin";
