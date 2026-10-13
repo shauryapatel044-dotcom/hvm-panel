@@ -558,18 +558,42 @@ CREATED_AT="${conf.createdAt || new Date().toISOString()}"
   }
 
   /**
+   * Discovers the path to the installed vm.sh manager script
+   */
+  static getVmScriptPath(): string | null {
+    if (process.platform === "win32") return null;
+    const candidates = [
+      "/usr/local/bin/vm.sh",
+      "/root/vms/vm.sh",
+      path.resolve(__dirname, "../../scripts/vm.sh"),
+      "/root/hvm-panel/scripts/vm.sh",
+      path.join(os.homedir(), "vms", "vm.sh"),
+    ];
+    for (const cand of candidates) {
+      if (fsSync.existsSync(cand)) return cand;
+    }
+    return null;
+  }
+
+  /**
    * Checks if VM process is actively running via PID file or pgrep (matching hopingboyz vm.sh)
    */
   static async isVmRunning(name: string): Promise<boolean> {
-    const pidFile = path.join(PIDS_DIR, `${name}.pid`);
-    try {
-      const pidStr = (await fs.readFile(pidFile, "utf-8")).trim();
-      const pid = parseInt(pidStr, 10);
-      if (!Number.isNaN(pid) && pid > 0) {
-        process.kill(pid, 0); // Throws if not running
-        return true;
-      }
-    } catch {}
+    const candidatePidFiles = [
+      path.join(PIDS_DIR, `${name}.pid`),
+      `/root/vms/${name}.pid`,
+      path.join(os.homedir(), "vms", `${name}.pid`),
+    ];
+    for (const pidFile of candidatePidFiles) {
+      try {
+        const pidStr = (await fs.readFile(pidFile, "utf-8")).trim();
+        const pid = parseInt(pidStr, 10);
+        if (!Number.isNaN(pid) && pid > 0) {
+          process.kill(pid, 0); // Throws if not running
+          return true;
+        }
+      } catch {}
+    }
 
     // Fallback matching hopingboyz-vm.sh: pgrep -f "qemu-system-x86_64.*$name"
     if (process.platform !== "win32") {
@@ -587,15 +611,21 @@ CREATED_AT="${conf.createdAt || new Date().toISOString()}"
    * Retrieves active PID of VM
    */
   static async getVmPid(name: string): Promise<number | null> {
-    const pidFile = path.join(PIDS_DIR, `${name}.pid`);
-    try {
-      const pidStr = (await fs.readFile(pidFile, "utf-8")).trim();
-      const pid = parseInt(pidStr, 10);
-      if (!Number.isNaN(pid) && pid > 0) {
-        process.kill(pid, 0);
-        return pid;
-      }
-    } catch {}
+    const candidatePidFiles = [
+      path.join(PIDS_DIR, `${name}.pid`),
+      `/root/vms/${name}.pid`,
+      path.join(os.homedir(), "vms", `${name}.pid`),
+    ];
+    for (const pidFile of candidatePidFiles) {
+      try {
+        const pidStr = (await fs.readFile(pidFile, "utf-8")).trim();
+        const pid = parseInt(pidStr, 10);
+        if (!Number.isNaN(pid) && pid > 0) {
+          process.kill(pid, 0);
+          return pid;
+        }
+      } catch {}
+    }
 
     // Fallback matching hopingboyz-vm.sh: pgrep -f "qemu-system-x86_64.*$name"
     if (process.platform !== "win32") {
@@ -671,6 +701,26 @@ CREATED_AT="${conf.createdAt || new Date().toISOString()}"
     if (await this.isVmRunning(conf.name)) {
       const currentPid = await this.getVmPid(conf.name);
       return currentPid || 0;
+    }
+
+    // Save and mirror .conf file to both /var/lib/hvm-vps/configs and /root/vms
+    await this.writeConfigFile(conf).catch(() => {});
+
+    // First attempt: Boot directly via hopingboyz vm.sh script
+    const vmScript = this.getVmScriptPath();
+    if (vmScript && process.platform !== "win32") {
+      try {
+        console.log(`[HVM-QEMU] Booting via script: ${vmScript} start ${conf.name} --daemon`);
+        await execFileAsync("bash", [vmScript, "start", conf.name, "--daemon"], { timeout: 15000 });
+        await new Promise((r) => setTimeout(r, 1200));
+        const scriptPid = await this.getVmPid(conf.name);
+        if (scriptPid) {
+          console.log(`[HVM-QEMU] VM '${conf.name}' booted via ${vmScript} (PID: ${scriptPid})`);
+          return scriptPid;
+        }
+      } catch (scriptErr: any) {
+        console.warn(`[HVM-QEMU] vm.sh execution note: ${scriptErr.message}. Launching via direct engine...`);
+      }
     }
 
     const pidFile = conf.pidFile || path.join(PIDS_DIR, `${conf.name}.pid`);
@@ -864,6 +914,13 @@ CREATED_AT="${conf.createdAt || new Date().toISOString()}"
    * Safely stops or kills the QEMU process
    */
   static async stopVm(name: string, force = false): Promise<void> {
+    const vmScript = this.getVmScriptPath();
+    if (vmScript && process.platform !== "win32") {
+      try {
+        await execFileAsync("bash", [vmScript, "stop", name], { timeout: 10000 });
+      } catch {}
+    }
+
     const pid = await this.getVmPid(name);
     const pidFile = path.join(PIDS_DIR, `${name}.pid`);
 
@@ -903,6 +960,8 @@ CREATED_AT="${conf.createdAt || new Date().toISOString()}"
     }
 
     await fs.unlink(pidFile).catch(() => {});
+    await fs.unlink(`/root/vms/${name}.pid`).catch(() => {});
+    await fs.unlink(path.join(os.homedir(), "vms", `${name}.pid`)).catch(() => {});
   }
 
   /**
@@ -1191,6 +1250,13 @@ exec sshpass -p '${conf.password}' ssh -o StrictHostKeyChecking=no -o UserKnownH
     }
     await this.stopVm(name, true);
 
+    const vmScript = this.getVmScriptPath();
+    if (vmScript && process.platform !== "win32") {
+      try {
+        await execFileAsync("bash", [vmScript, "delete", name, "--force"], { timeout: 10000 });
+      } catch {}
+    }
+
     const conf = await this.readConfigFile(name);
     const diskPath = conf?.diskPath || path.join(DISKS_DIR, `${name}.qcow2`);
     const seedIso = conf?.seedIso || path.join(SEEDS_DIR, `${name}-seed.iso`);
@@ -1203,5 +1269,15 @@ exec sshpass -p '${conf.password}' ssh -o StrictHostKeyChecking=no -o UserKnownH
     await fs.unlink(pidFile).catch(() => {});
     await fs.unlink(logFile).catch(() => {});
     await fs.unlink(confPath).catch(() => {});
+
+    // Also clean from /root/vms and $HOME/vms
+    const externalDirs = ["/root/vms", path.join(os.homedir(), "vms"), "/var/lib/hvm-vps/configs"];
+    for (const d of externalDirs) {
+      await fs.unlink(path.join(d, `${name}.conf`)).catch(() => {});
+      await fs.unlink(path.join(d, `${name}.img`)).catch(() => {});
+      await fs.unlink(path.join(d, `${name}-seed.iso`)).catch(() => {});
+      await fs.unlink(path.join(d, `${name}.pid`)).catch(() => {});
+      await fs.unlink(path.join(d, `${name}.log`)).catch(() => {});
+    }
   }
 }

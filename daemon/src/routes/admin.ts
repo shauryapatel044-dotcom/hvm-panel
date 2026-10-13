@@ -189,8 +189,11 @@ router.post("/instances", async (req: Request, res: Response) => {
 
     try {
       const seedIsoPath = await LibvirtService.createDiskAndSeedIso(domainSpec);
-      const domainXml = LibvirtService.buildDomainXml({ ...domainSpec, seedIsoPath });
-      await LibvirtService.defineAndStartXml(domainXml, name);
+      // Only attempt libvirt domain XML definition if instance is not already running via vm.sh / QEMU
+      if (!(await QemuVpsService.isVmRunning(name))) {
+        const domainXml = LibvirtService.buildDomainXml({ ...domainSpec, seedIsoPath });
+        await LibvirtService.defineAndStartXml(domainXml, name);
+      }
     } catch (libvirtErr: any) {
       console.warn(`[HVM-Libvirt] Hypervisor note (${name}): ${libvirtErr.message}`);
     }

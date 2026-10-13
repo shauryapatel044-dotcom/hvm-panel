@@ -147,6 +147,11 @@ IMG_FILE="$IMG_FILE"
 SEED_FILE="$SEED_FILE"
 CREATED="$CREATED"
 EOF
+
+    # Also mirror into /var/lib/hvm-vps/configs so HVM control panel daemon detects it
+    if [ -d "/var/lib/hvm-vps/configs" ]; then
+        cp -f "$config_file" "/var/lib/hvm-vps/configs/$VM_NAME.conf" 2>/dev/null || true
+    fi
     
     print_status "SUCCESS" "Configuration saved to $config_file"
 }
@@ -347,12 +352,19 @@ EOF
 # Function to start a VM
 start_vm() {
     local vm_name=$1
+    local run_mode=${2:-"daemon"}
     
     if load_vm_config "$vm_name"; then
         print_status "INFO" "Starting VM: $vm_name"
         print_status "INFO" "SSH: ssh -p $SSH_PORT $USERNAME@localhost"
         print_status "INFO" "Password: $PASSWORD"
         
+        # Check if already running
+        if is_vm_running "$vm_name"; then
+            print_status "WARN" "VM '$vm_name' is already running"
+            return 0
+        fi
+
         # Check if image file exists
         if [[ ! -f "$IMG_FILE" ]]; then
             print_status "ERROR" "VM image file not found: $IMG_FILE"
@@ -365,13 +377,21 @@ start_vm() {
             setup_vm_image
         fi
         
+        # Detect KVM hardware acceleration vs Non-KVM TCG software emulation
+        local accel_args=()
+        if [ -w /dev/kvm ] && [ -r /dev/kvm ]; then
+            accel_args=(-enable-kvm -cpu host)
+        else
+            print_status "INFO" "Non-KVM environment detected: utilizing multi-threaded TCG emulation"
+            accel_args=(-accel tcg,thread=multi -cpu qemu64)
+        fi
+
         # Base QEMU command
         local qemu_cmd=(
             qemu-system-x86_64
-            -enable-kvm
+            "${accel_args[@]}"
             -m "$MEMORY"
             -smp "$CPUS"
-            -cpu host
             -drive "file=$IMG_FILE,format=qcow2,if=virtio"
             -drive "file=$SEED_FILE,format=raw,if=virtio"
             -boot order=c
@@ -389,13 +409,6 @@ start_vm() {
             done
         fi
 
-        # Add GUI or console mode
-        if [[ "$GUI_MODE" == true ]]; then
-            qemu_cmd+=(-vga virtio -display gtk,gl=on)
-        else
-            qemu_cmd+=(-nographic -serial mon:stdio)
-        fi
-
         # Add performance enhancements
         qemu_cmd+=(
             -device virtio-balloon-pci
@@ -403,27 +416,60 @@ start_vm() {
             -device virtio-rng-pci,rng=rng0
         )
 
-        print_status "INFO" "Starting QEMU..."
-        "${qemu_cmd[@]}"
-        
-        print_status "INFO" "VM $vm_name has been shut down"
+        local pid_file="$VM_DIR/$vm_name.pid"
+        local log_file="$VM_DIR/$vm_name.log"
+
+        if [ "$run_mode" = "daemon" ]; then
+            qemu_cmd+=(
+                -display none
+                -serial "file:$log_file"
+                -daemonize
+                -pidfile "$pid_file"
+            )
+            print_status "INFO" "Launching QEMU in daemon background mode..."
+            "${qemu_cmd[@]}"
+            sleep 1
+            if is_vm_running "$vm_name"; then
+                print_status "SUCCESS" "VM '$vm_name' started successfully (PID: $(cat "$pid_file" 2>/dev/null || echo 'active'))"
+            else
+                print_status "ERROR" "VM '$vm_name' failed to start. Last log lines:"
+                tail -n 20 "$log_file" 2>/dev/null || true
+                return 1
+            fi
+        else
+            if [[ "$GUI_MODE" == true ]]; then
+                qemu_cmd+=(-vga virtio -display gtk,gl=on)
+            else
+                qemu_cmd+=(-nographic -serial mon:stdio)
+            fi
+            print_status "INFO" "Starting QEMU in foreground..."
+            "${qemu_cmd[@]}"
+            print_status "INFO" "VM $vm_name has been shut down"
+        fi
     fi
 }
 
 # Function to delete a VM
 delete_vm() {
     local vm_name=$1
+    local force=${2:-false}
     
-    print_status "WARN" "This will permanently delete VM '$vm_name' and all its data!"
-    read -p "$(print_status "INPUT" "Are you sure? (y/N): ")" -n 1 -r
-    echo
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
-        if load_vm_config "$vm_name"; then
-            rm -f "$IMG_FILE" "$SEED_FILE" "$VM_DIR/$vm_name.conf"
-            print_status "SUCCESS" "VM '$vm_name' has been deleted"
+    if [ "$force" != "true" ] && [ "$force" != "--force" ] && [ -t 0 ]; then
+        print_status "WARN" "This will permanently delete VM '$vm_name' and all its data!"
+        read -p "$(print_status "INPUT" "Are you sure? (y/N): ")" -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            print_status "INFO" "Deletion cancelled"
+            return 0
         fi
-    else
-        print_status "INFO" "Deletion cancelled"
+    fi
+
+    if load_vm_config "$vm_name"; then
+        stop_vm "$vm_name" 2>/dev/null || true
+        rm -f "$IMG_FILE" "$SEED_FILE" "$VM_DIR/$vm_name.conf" "$VM_DIR/$vm_name.pid" "$VM_DIR/$vm_name.log"
+        # Mirror cleanup in /var/lib/hvm-vps if present
+        rm -f "/var/lib/hvm-vps/configs/$vm_name.conf" "/var/lib/hvm-vps/disks/$vm_name.qcow2" "/var/lib/hvm-vps/seeds/$vm_name-seed.iso" 2>/dev/null || true
+        print_status "SUCCESS" "VM '$vm_name' has been deleted"
     fi
 }
 
@@ -448,16 +494,27 @@ show_vm_info() {
         echo "Created: $CREATED"
         echo "Image File: $IMG_FILE"
         echo "Seed File: $SEED_FILE"
+        echo "Status: $(is_vm_running "$vm_name" && echo "RUNNING" || echo "STOPPED")"
         echo "=========================================="
         echo
-        read -p "$(print_status "INPUT" "Press Enter to continue...")"
+        if [ -t 0 ]; then
+            read -p "$(print_status "INPUT" "Press Enter to continue...")"
+        fi
     fi
 }
 
 # Function to check if VM is running
 is_vm_running() {
     local vm_name=$1
-    if pgrep -f "qemu-system-x86_64.*$vm_name" >/dev/null; then
+    local pid_file="$VM_DIR/$vm_name.pid"
+    if [ -f "$pid_file" ]; then
+        local pid
+        pid=$(cat "$pid_file" 2>/dev/null || true)
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            return 0
+        fi
+    fi
+    if pgrep -f "qemu-system-x86_64.*$vm_name" >/dev/null 2>&1; then
         return 0
     else
         return 1
@@ -471,17 +528,85 @@ stop_vm() {
     if load_vm_config "$vm_name"; then
         if is_vm_running "$vm_name"; then
             print_status "INFO" "Stopping VM: $vm_name"
-            pkill -f "qemu-system-x86_64.*$IMG_FILE"
+            local pid_file="$VM_DIR/$vm_name.pid"
+            if [ -f "$pid_file" ]; then
+                local pid
+                pid=$(cat "$pid_file" 2>/dev/null || true)
+                if [ -n "$pid" ]; then
+                    kill "$pid" 2>/dev/null || true
+                fi
+            fi
+            pkill -f "qemu-system-x86_64.*$IMG_FILE" 2>/dev/null || true
+            pkill -f "qemu-system-x86_64.*$vm_name" 2>/dev/null || true
             sleep 2
             if is_vm_running "$vm_name"; then
                 print_status "WARN" "VM did not stop gracefully, forcing termination..."
-                pkill -9 -f "qemu-system-x86_64.*$IMG_FILE"
+                pkill -9 -f "qemu-system-x86_64.*$IMG_FILE" 2>/dev/null || true
+                pkill -9 -f "qemu-system-x86_64.*$vm_name" 2>/dev/null || true
             fi
+            rm -f "$VM_DIR/$vm_name.pid"
             print_status "SUCCESS" "VM $vm_name stopped"
         else
             print_status "INFO" "VM $vm_name is not running"
         fi
     fi
+}
+
+# Function to restart a VM
+restart_vm() {
+    local vm_name=$1
+    local mode=${2:-"daemon"}
+    stop_vm "$vm_name"
+    sleep 1
+    start_vm "$vm_name" "$mode"
+}
+
+# Function to create VM non-interactively via CLI
+create_vm_cli() {
+    local vm_name=$1
+    local os_type=${2:-"Ubuntu 24.04"}
+    local disk_size=${3:-"20G"}
+    local memory=${4:-2048}
+    local cpus=${5:-2}
+    local ssh_port=${6:-2222}
+    local username=${7:-"root"}
+    local password=${8:-"root123"}
+    local hostname=${9:-"$vm_name"}
+    local port_forwards=${10:-""}
+    local gui_mode=${11:-false}
+
+    # Match OS
+    local found_os=""
+    for os_label in "${!OS_OPTIONS[@]}"; do
+        if [[ "${os_label,,}" == *"${os_type,,}"* ]] || [[ "${os_type,,}" == *"${os_label,,}"* ]]; then
+            found_os="$os_label"
+            break
+        fi
+    done
+    if [ -z "$found_os" ]; then
+        found_os="Ubuntu 24.04"
+    fi
+
+    IFS='|' read -r OS_TYPE CODENAME IMG_URL DEFAULT_HOSTNAME DEFAULT_USERNAME DEFAULT_PASSWORD <<< "${OS_OPTIONS[$found_os]}"
+
+    VM_NAME="$vm_name"
+    HOSTNAME="$hostname"
+    USERNAME="$username"
+    PASSWORD="$password"
+    DISK_SIZE="$disk_size"
+    MEMORY="$memory"
+    CPUS="$cpus"
+    SSH_PORT="$ssh_port"
+    GUI_MODE="$gui_mode"
+    PORT_FORWARDS="$port_forwards"
+
+    IMG_FILE="$VM_DIR/$VM_NAME.img"
+    SEED_FILE="$VM_DIR/$VM_NAME-seed.iso"
+    CREATED="$(date)"
+
+    setup_vm_image
+    save_vm_config
+    print_status "SUCCESS" "VM '$VM_NAME' configured and ready"
 }
 
 # Function to edit VM configuration
@@ -771,7 +896,7 @@ main_menu() {
                 if [ $vm_count -gt 0 ]; then
                     read -p "$(print_status "INPUT" "Enter VM number to start: ")" vm_num
                     if [[ "$vm_num" =~ ^[0-9]+$ ]] && [ "$vm_num" -ge 1 ] && [ "$vm_num" -le $vm_count ]; then
-                        start_vm "${vms[$((vm_num-1))]}"
+                        start_vm "${vms[$((vm_num-1))]}" "foreground"
                     else
                         print_status "ERROR" "Invalid selection"
                     fi
@@ -857,7 +982,10 @@ trap cleanup EXIT
 check_dependencies
 
 # Initialize paths
-VM_DIR="${VM_DIR:-$HOME/vms}"
+VM_DIR="${VM_DIR:-/root/vms}"
+if [ "${EUID:-$(id -u 2>/dev/null || echo 1000)}" -ne 0 ] && [ "$VM_DIR" = "/root/vms" ]; then
+    VM_DIR="$HOME/vms"
+fi
 mkdir -p "$VM_DIR"
 
 # Supported OS list
@@ -872,5 +1000,92 @@ declare -A OS_OPTIONS=(
     ["Rocky Linux 9"]="rockylinux|9|https://download.rockylinux.org/pub/rocky/9/images/x86_64/Rocky-9-GenericCloud.latest.x86_64.qcow2|rocky9|rocky|rocky"
 )
 
-# Start the main menu
+# =============================
+# CLI Command Dispatcher
+# =============================
+if [ $# -gt 0 ]; then
+    cmd="$1"
+    shift
+    case "$cmd" in
+        "create")
+            if [ $# -lt 1 ]; then
+                echo "Usage: $0 create <name> [os_type] [disk_size] [memory_mb] [cpus] [ssh_port] [username] [password] [hostname] [port_forwards] [gui_mode]"
+                exit 1
+            fi
+            create_vm_cli "$@"
+            ;;
+        "start")
+            if [ $# -lt 1 ]; then
+                echo "Usage: $0 start <name> [--foreground|--daemon]"
+                exit 1
+            fi
+            vm_target="$1"
+            run_mode="daemon"
+            if [ "${2:-}" = "--foreground" ]; then
+                run_mode="foreground"
+            fi
+            start_vm "$vm_target" "$run_mode"
+            ;;
+        "stop")
+            if [ $# -lt 1 ]; then
+                echo "Usage: $0 stop <name>"
+                exit 1
+            fi
+            stop_vm "$1"
+            ;;
+        "restart"|"reboot")
+            if [ $# -lt 1 ]; then
+                echo "Usage: $0 restart <name>"
+                exit 1
+            fi
+            restart_vm "$1" "daemon"
+            ;;
+        "delete"|"destroy"|"remove")
+            if [ $# -lt 1 ]; then
+                echo "Usage: $0 delete <name> [--force]"
+                exit 1
+            fi
+            delete_vm "$1" "${2:-}"
+            ;;
+        "status")
+            if [ $# -lt 1 ]; then
+                echo "Usage: $0 status <name>"
+                exit 1
+            fi
+            if is_vm_running "$1"; then
+                echo "running"
+                exit 0
+            else
+                echo "stopped"
+                exit 1
+            fi
+            ;;
+        "list")
+            echo "Configured VMs in $VM_DIR:"
+            for c in $(get_vm_list); do
+                if is_vm_running "$c"; then
+                    echo "  - $c: RUNNING"
+                else
+                    echo "  - $c: STOPPED"
+                fi
+            done
+            ;;
+        "info")
+            if [ $# -lt 1 ]; then
+                echo "Usage: $0 info <name>"
+                exit 1
+            fi
+            show_vm_info "$1"
+            ;;
+        *)
+            echo "Unknown command: $cmd"
+            echo "Usage: $0 [create|start|stop|restart|delete|status|list|info] [args...]"
+            echo "Run without arguments for interactive management menu."
+            exit 1
+            ;;
+    esac
+    exit 0
+fi
+
+# Start the interactive main menu when run with no arguments
 main_menu
