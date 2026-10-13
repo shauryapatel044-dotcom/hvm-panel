@@ -549,7 +549,7 @@ start_vm() {
     "${cdrom_args[@]}" \
     -netdev "user,id=net0,hostfwd=tcp::${SSH_PORT}-:22" \
     -device "virtio-net-pci,netdev=net0" \
-    -nographic \
+    -display none \
     -serial "file:${log_file}" \
     -daemonize \
     -pidfile "${pid_file}" >/dev/null 2>&1

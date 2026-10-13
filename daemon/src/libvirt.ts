@@ -889,7 +889,7 @@ ${cpuXml}`;
   <name>${spec.name}</name>
   <uuid>${spec.uuid}</uuid>${cpuAndMemoryXml}
   <os>
-    <type arch='x86_64' machine='pc-q35'>hvm</type>
+    <type arch='x86_64' machine='pc'>hvm</type>
     <boot dev='hd'/>
     <boot dev='cdrom'/>
   </os>
@@ -903,6 +903,7 @@ ${cpuXml}`;
   <on_crash>destroy</on_crash>
   <devices>
     <emulator>/usr/bin/qemu-system-x86_64</emulator>
+    <controller type='pci' index='0' model='pci-root'/>
     <disk type='file' device='disk'>
       <driver name='qemu' type='qcow2' cache='writeback' discard='unmap'/>
       <source file='${spec.diskPath}'/>
