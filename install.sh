@@ -29,6 +29,12 @@ DB_NAME="hvm_panel"
 DB_USER="hvm_user"
 DB_PASS="${HVM_DB_PASS:-$(openssl rand -hex 12 2>/dev/null || echo 'hvm_secret_db_pass')}"
 JWT_SECRET="$(openssl rand -hex 32 2>/dev/null || echo 'hvm_super_secret_jwt_key_2026')"
+if [[ -f "${DAEMON_DIR}/.env" ]]; then
+  EXISTING_PASS="$(grep '^DB_PASSWORD=' "${DAEMON_DIR}/.env" 2>/dev/null | cut -d'=' -f2- || true)"
+  EXISTING_JWT="$(grep '^JWT_SECRET=' "${DAEMON_DIR}/.env" 2>/dev/null | cut -d'=' -f2- || true)"
+  if [[ -n "$EXISTING_PASS" ]]; then DB_PASS="$EXISTING_PASS"; fi
+  if [[ -n "$EXISTING_JWT" ]]; then JWT_SECRET="$EXISTING_JWT"; fi
+fi
 ADMIN_USER="${HVM_ADMIN_USER:-admin}"
 ADMIN_EMAIL="${HVM_ADMIN_EMAIL:-admin@hvm.local}"
 ADMIN_PASS="${HVM_ADMIN_PASS:-admin}"
