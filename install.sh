@@ -65,7 +65,7 @@ dpkg --configure -a >/dev/null 2>&1 || true
 
 apt-get update -y || true
 apt-get install -y \
-  curl wget git gnupg2 ca-certificates lsb-release openssl psmisc \
+  curl wget git gnupg2 ca-certificates lsb-release openssl psmisc sshpass \
   build-essential pkg-config \
   qemu-kvm qemu-utils libvirt-daemon-system libvirt-clients \
   bridge-utils virtinst ovmf cloud-image-utils genisoimage \

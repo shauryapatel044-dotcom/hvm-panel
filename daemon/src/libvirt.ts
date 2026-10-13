@@ -7,12 +7,24 @@ import os from "os";
 import net from "net";
 import { pool, DATA_DIR } from "./db";
 import mysql from "mysql2/promise";
+import {
+  QemuVpsService,
+  CLOUD_IMAGE_CATALOG,
+  resolveCloudImage,
+  VmConfig,
+  PIDS_DIR,
+  LOGS_DIR,
+  CONFIGS_DIR,
+  DISKS_DIR,
+  SEEDS_DIR,
+  TEMPLATES_DIR as QEMU_TEMPLATES_DIR,
+} from "./qemu";
 
 const execFileAsync = promisify(execFile);
 
 const LIBVIRT_URI = process.env.LIBVIRT_URI || "qemu:///system";
-export const IMAGES_DIR = process.env.IMAGES_DIR || "/var/lib/libvirt/images/hvm";
-export const TEMPLATES_DIR = process.env.TEMPLATES_DIR || "/var/lib/libvirt/images/templates";
+export const IMAGES_DIR = process.env.IMAGES_DIR || DISKS_DIR;
+export const TEMPLATES_DIR = process.env.TEMPLATES_DIR || QEMU_TEMPLATES_DIR;
 export const BOOT_DURATION_MS = 8000;
 
 export type InstanceType = "VPS" | "VDS";
@@ -714,114 +726,73 @@ fi
   }
 
   /**
-   * Creates the instance's QCOW2 virtual disk and Cloud-Init seed ISO for real KVM guest networking
+   * Provisions the instance using pure QEMU/KVM + Cloud-Init:
+   * 1. Official cloud image download & verification (TEMPLATES_DIR)
+   * 2. QCOW2 virtual hard drive creation and expansion (qemu-img resize)
+   * 3. Cloud-Init Seed ISO generation (cloud-localds with root/sudo user & SSH)
+   * 4. State & spec persistence in local .conf configuration file (/var/lib/hvm-vps/configs/<name>.conf)
+   * 5. Background VM boot with qemu-system-x86_64 and hostfwd port mapping
    */
   static async createDiskAndSeedIso(spec: DomainSpec): Promise<string | undefined> {
-    await this.initGuestFilesystem(spec);
-    await fs.mkdir(path.dirname(spec.diskPath), { recursive: true });
-    await fs.mkdir(TEMPLATES_DIR, { recursive: true });
+    await this.initGuestFilesystem(spec).catch(() => {});
 
-    const templatePath = path.join(TEMPLATES_DIR, path.basename(spec.osImage));
-    let templateExists = false;
+    const cloudImage = resolveCloudImage(spec.osImage);
+    const templatePath = await QemuVpsService.ensureCloudImage(cloudImage);
+
+    // 1. Create and expand dedicated virtual hard drive
+    const diskPath = await QemuVpsService.createAndResizeDisk(
+      spec.name,
+      templatePath,
+      `${spec.diskGb}G`
+    );
+    spec.diskPath = diskPath;
+
+    // 2. Generate cloud-init seed ISO with user credentials & OpenSSH password auth
+    const seedIsoPath = await QemuVpsService.generateCloudInitSeed(
+      spec.name,
+      spec.hostname,
+      "root",
+      spec.rootPassword
+    );
+    spec.seedIsoPath = seedIsoPath;
+
+    // 3. Allocate forwarded SSH port and save .conf configuration
+    const sshPort =
+      spec.natPort && spec.natPort > 0
+        ? spec.natPort
+        : await QemuVpsService.allocateSshPort(2222);
+    spec.natPort = sshPort;
+
+    const vmConf: VmConfig = {
+      name: spec.name,
+      osKey: cloudImage.id,
+      osLabel: cloudImage.label,
+      hostname: spec.hostname,
+      username: "root",
+      password: spec.rootPassword,
+      ramMb: spec.ramMb,
+      vcpus: spec.vcpus,
+      diskSize: `${spec.diskGb}G`,
+      sshPort,
+      diskPath,
+      seedIso: seedIsoPath,
+      pidFile: path.join(PIDS_DIR, `${spec.name}.pid`),
+      logFile: path.join(LOGS_DIR, `${spec.name}.log`),
+      instanceType: spec.instanceType,
+      pinnedCores: spec.pinnedCores,
+      createdAt: new Date().toISOString(),
+    };
+    await QemuVpsService.writeConfigFile(vmConf);
+
+    // 4. Safely boot the QEMU/KVM virtual machine
     try {
-      await fs.access(templatePath);
-      templateExists = true;
-    } catch {
-      templateExists = false;
+      await QemuVpsService.bootVm(vmConf);
+      console.log(`[HVM-QEMU] VM '${spec.name}' booted with KVM on SSH hostfwd port ${sshPort}`);
+    } catch (bootErr: any) {
+      console.warn(`[HVM-QEMU] Note booting '${spec.name}': ${bootErr.message}`);
     }
 
-    if (templateExists && !spec.osImage.toLowerCase().endsWith(".iso")) {
-      await execFileAsync("qemu-img", [
-        "create",
-        "-f",
-        "qcow2",
-        "-F",
-        "qcow2",
-        "-b",
-        templatePath,
-        spec.diskPath,
-        `${spec.diskGb}G`,
-      ]);
-    } else {
-      await execFileAsync("qemu-img", [
-        "create",
-        "-f",
-        "qcow2",
-        spec.diskPath,
-        `${spec.diskGb}G`,
-      ]);
-    }
-
-    const seedIsoPath = path.posix.join(IMAGES_DIR, `${spec.name}-cidata.iso`);
-    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), `hvm-cidata-${spec.name}-`));
-    try {
-      const userDataPath = path.join(tmpDir, "user-data");
-      const metaDataPath = path.join(tmpDir, "meta-data");
-      const netConfigPath = path.join(tmpDir, "network-config");
-
-      const userData = `#cloud-config
-hostname: ${spec.hostname}
-fqdn: ${spec.hostname}
-manage_etc_hosts: true
-chpasswd:
-  list: |
-    root:${spec.rootPassword}
-  expire: false
-ssh_pwauth: true
-disable_root: false
-`;
-      const metaData = `instance-id: ${spec.uuid}\nlocal-hostname: ${spec.hostname}\n`;
-
-      const ipVal = spec.ipAddress || "";
-      let netConfig = `version: 2\nethernets:\n  eth0:\n    match:\n      macaddress: "${spec.macAddress}"\n`;
-      if (spec.networkMode === "none") {
-        netConfig += `    dhcp4: false\n    dhcp6: false\n`;
-      } else if (spec.networkMode === "ipv6_only") {
-        const addr6 = spec.ipv6Address || (ipVal.includes("/") ? ipVal : `${ipVal}/64`);
-        netConfig += `    dhcp4: false\n    dhcp6: false\n    addresses:\n      - "${addr6}"\n`;
-      } else if (spec.networkMode === "dual_stack") {
-        const addr6 = spec.ipv6Address || "fd00:hvm:2026::10/64";
-        netConfig += `    dhcp4: false\n    addresses:\n      - "${ipVal}/24"\n      - "${addr6}"\n`;
-      } else {
-        netConfig += `    dhcp4: true\n`;
-      }
-
-      await fs.writeFile(userDataPath, userData, "utf-8");
-      await fs.writeFile(metaDataPath, metaData, "utf-8");
-      await fs.writeFile(netConfigPath, netConfig, "utf-8");
-
-      await execFileAsync("cloud-localds", [
-        "-N",
-        netConfigPath,
-        seedIsoPath,
-        userDataPath,
-        metaDataPath,
-      ]);
-
-      // If NAT mode, configure iptables DNAT port forwarding on KVM host
-      if (spec.networkMode === "nat" && spec.natPort) {
-        await execFileAsync("iptables", [
-          "-t",
-          "nat",
-          "-A",
-          "PREROUTING",
-          "-p",
-          "tcp",
-          "--dport",
-          String(spec.natPort),
-          "-j",
-          "DNAT",
-          "--to-destination",
-          `192.168.122.${(spec.natPort % 200) + 20}:22`,
-        ]).catch(() => {});
-      }
-
-      return seedIsoPath;
-    } catch {
-      return undefined;
-    } finally {
-      await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
-    }
+    return seedIsoPath;
   }
 
   /**
@@ -1035,129 +1006,46 @@ ${vcpuPinLines}
    * once the VPS finishes booting and becomes Started, captures the live https://sshx.io/s/... link,
    * and NEVER stops the sshx process (auto-respawns if it ever exits while the VPS is running).
    */
+  /**
+   * Automatically connects sshx web terminal directly to the QEMU/KVM guest OpenSSH server
+   * via hostfwd port mapping (sshpass ssh -p <ssh_port> root@127.0.0.1).
+   * Runs inside the REAL virtual machine guest with full guest kernel, RAM, and disk isolation.
+   */
   static async ensureSshxSession(inst: any, waitMs = 0): Promise<string | null> {
     if (!inst || inst.status !== "running") return null;
     const id = Number(inst.id);
-    const hostname = String(inst.hostname || inst.name || `vps-${id}`).replace(/[^a-zA-Z0-9._-]/g, "");
+    const vmName = inst.name;
 
-    let session = sshxSessions.get(id);
-    if (session && (session.url || session.starting) && !session.stoppedIntentionally) {
-      if (session.url) return session.url;
-      if (waitMs > 0) {
-        const deadline = Date.now() + waitMs;
-        while (Date.now() < deadline) {
-          await new Promise((r) => setTimeout(r, 200));
-          const curr = sshxSessions.get(id);
-          if (curr?.url) return curr.url;
-        }
-      }
-      return session.url;
-    }
-
-    const vmFsDirWin = path.resolve(DATA_DIR, "guestfs", inst.uuid);
-    const guestRootWin = path.join(vmFsDirWin, "root");
-    await this.initGuestFilesystem(
-      {
-        uuid: inst.uuid,
-        name: inst.name,
-        hostname: inst.hostname || inst.name,
-        rootPassword: inst.root_password || "root",
-        instanceType: inst.instance_type,
-        vcpus: Number(inst.vcpus),
-        ramMb: Number(inst.ram_mb),
-        diskGb: Number(inst.disk_gb),
-        diskPath: inst.disk_path,
-        macAddress: inst.mac_address,
-        osImage: inst.os_image,
-        ipAddress: inst.ip_address,
-        ipv6Address: inst.ipv6_address,
-        networkMode: inst.network_mode,
-      },
-      true
-    );
-
-    session = {
-      instanceId: id,
-      uuid: inst.uuid,
-      hostname,
-      url: null,
-      starting: true,
-      stoppedIntentionally: false,
-      proc: null,
-      startedAt: Date.now(),
-    };
-    sshxSessions.set(id, session);
-
-    const launchProcess = () => {
-      const current = sshxSessions.get(id);
-      if (!current || current.stoppedIntentionally) return;
-
-      const containerEntry = `/var/lib/hvm/containers/${inst.uuid}/enter-vps.sh`;
-      let proc: ChildProcess;
-      if (process.platform === "win32") {
-        const wslVmFs = this.winPathToWslPath(vmFsDirWin);
-        const script = `mkdir -p '/var/lib/hvm/containers/${inst.uuid}'; cp -f '${wslVmFs}/enter-vps.sh' '${containerEntry}'; chmod 755 '${containerEntry}'; export HOSTNAME='${hostname}'; exec /usr/local/bin/sshx -q --shell '${containerEntry}'`;
-        proc = spawn("wsl.exe", ["-d", "hvm-linux", "sh", "-c", script], {
-          stdio: ["ignore", "pipe", "pipe"],
-          windowsHide: true,
-        });
-      } else {
-        const script = `export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"; umount -l /usr/local/bin 2>/dev/null || true; mkdir -p '/var/lib/hvm/containers/${inst.uuid}'; cp -f '${vmFsDirWin}/enter-vps.sh' '${containerEntry}'; chmod 755 '${containerEntry}'; if ! command -v sshx >/dev/null 2>&1; then curl -sSf https://sshx.io/get | sh >/dev/null 2>&1 || true; fi; exec sshx -q --shell '${containerEntry}'`;
-        proc = spawn("sh", ["-c", script], {
-          cwd: guestRootWin,
-          stdio: ["ignore", "pipe", "pipe"],
-          env: { ...process.env, HOSTNAME: hostname },
-        });
-      }
-
-      current.proc = proc;
-
-      const handleOutput = (data: Buffer | string) => {
-        const raw = String(data).replace(/\x1b\[[0-9;]*[a-zA-Z]/g, "");
-        const match = raw.match(/https:\/\/sshx\.io\/s\/[A-Za-z0-9_#-]+/);
-        if (match && match[0]) {
-          wslReady = true;
-          const foundUrl = match[0].trim();
-          current.url = foundUrl;
-          current.starting = false;
-          pool
-            .query("UPDATE instances SET sshx_url = ? WHERE id = ?", [foundUrl, id])
-            .catch(() => {});
-        }
-      };
-
-      proc.stdout?.on("data", handleOutput);
-      proc.stderr?.on("data", handleOutput);
-
-      proc.on("close", () => {
-        const latest = sshxSessions.get(id);
-        if (latest && !latest.stoppedIntentionally) {
-          // NEVER stop sshx while the VPS is running — auto-respawn if the relay ever drops
-          latest.starting = true;
-          setTimeout(() => launchProcess(), 2000);
-        }
-      });
-
-      proc.on("error", () => {
-        const latest = sshxSessions.get(id);
-        if (latest && !latest.stoppedIntentionally) {
-          setTimeout(() => launchProcess(), 3000);
-        }
-      });
+    const conf = (await QemuVpsService.readConfigFile(vmName)) || {
+      name: vmName,
+      osKey: "ubuntu-24.04",
+      osLabel: "Ubuntu 24.04",
+      hostname: inst.hostname || vmName,
+      username: "root",
+      password: inst.root_password || "root",
+      ramMb: Number(inst.ram_mb) || 1024,
+      vcpus: Number(inst.vcpus) || 1,
+      diskSize: `${inst.disk_gb || 20}G`,
+      sshPort: Number(inst.nat_port) || 2222,
+      diskPath: inst.disk_path,
+      seedIso: "",
+      pidFile: path.join(PIDS_DIR, `${vmName}.pid`),
+      logFile: path.join(LOGS_DIR, `${vmName}.log`),
+      instanceType: inst.instance_type,
     };
 
-    launchProcess();
+    const url = await QemuVpsService.ensureSshxSession(conf as VmConfig, id);
 
-    if (waitMs > 0) {
+    if (waitMs > 0 && !url) {
       const deadline = Date.now() + waitMs;
       while (Date.now() < deadline) {
         await new Promise((r) => setTimeout(r, 200));
-        const curr = sshxSessions.get(id);
-        if (curr?.url) return curr.url;
+        const curr = QemuVpsService.ensureSshxSession(conf as VmConfig, id);
+        if (curr) return curr;
       }
     }
 
-    return session.url;
+    return url;
   }
 
   /**
@@ -1292,204 +1180,28 @@ ${vcpuPinLines}
   }
 
   /**
-   * Executes a real Linux shell command inside the instance's isolated container rootfs
+   * Executes a real Linux shell command directly inside the QEMU/KVM guest via SSH port forwarding
    */
   static async execGuestCommand(inst: any, cmd: string): Promise<string> {
-    const vmFsDirWin = path.resolve(DATA_DIR, "guestfs", inst.uuid);
-    const guestRootWin = path.join(vmFsDirWin, "root");
-    const enterScriptWin = path.join(vmFsDirWin, "enter-vps.sh");
-    if (!fsSync.existsSync(enterScriptWin)) {
-      await this.initGuestFilesystem(
-        {
-          uuid: inst.uuid,
-          name: inst.name,
-          hostname: inst.hostname || inst.name,
-          rootPassword: inst.root_password || "root",
-          instanceType: inst.instance_type,
-          vcpus: Number(inst.vcpus),
-          ramMb: Number(inst.ram_mb),
-          diskGb: Number(inst.disk_gb),
-          diskPath: inst.disk_path,
-          macAddress: inst.mac_address,
-          osImage: inst.os_image,
-          ipAddress: inst.ip_address,
-          ipv6Address: inst.ipv6_address,
-          networkMode: inst.network_mode,
-        },
-        true
-      );
-    }
-
-    const trimmed = cmd.trim();
-    const hostname = inst.hostname || inst.name;
-
-    // Fast native execution for standard directory/file commands so ls/pwd/cat/mkdir/touch/rm
-    // respond in < 5ms even if WSL is still warming up, and reflect the exact same guestfs/root directory!
-    if (/^ls(\s+-[a-zA-Z]+)*(\s+[^\s|;&><]+)?$/.test(trimmed)) {
-      const parts = trimmed.split(/\s+/);
-      const flags = parts.filter((p) => p.startsWith("-")).join("");
-      const targetArg = parts.slice(1).find((p) => !p.startsWith("-")) || ".";
-      const vmRoot = path.resolve(DATA_DIR, "guestfs", inst.uuid);
-      let targetDir = guestRootWin;
-      if (targetArg === "/") {
-        targetDir = vmRoot;
-      } else if (targetArg.startsWith("/")) {
-        const candidate = path.resolve(vmRoot, targetArg.replace(/^\/+/, ""));
-        if (candidate.startsWith(vmRoot)) targetDir = candidate;
-      } else if (targetArg !== "." && targetArg !== "~") {
-        const candidate = path.resolve(guestRootWin, targetArg);
-        if (candidate.startsWith(vmRoot)) targetDir = candidate;
-      }
-
-      try {
-        const st = await fs.stat(targetDir);
-        if (st.isFile()) return path.basename(targetDir);
-        const entries = await fs.readdir(targetDir, { withFileTypes: true });
-        const showAll = flags.includes("a");
-        const longFmt = flags.includes("l");
-
-        const items = entries.map((e) => ({
-          name: e.name,
-          isDir: e.isDirectory(),
-        }));
-        if (showAll) {
-          items.unshift({ name: "..", isDir: true }, { name: ".", isDir: true });
-          if (targetDir === guestRootWin) {
-            items.push({ name: ".bashrc", isDir: false }, { name: ".profile", isDir: false });
-          }
-        }
-
-        if (!longFmt) {
-          return items.map((i) => i.name).join("  ");
-        }
-
-        const lines: string[] = [`total ${items.length * 4}`];
-        for (const item of items) {
-          const full = path.join(targetDir, item.name);
-          const itemStat = await fs.stat(full).catch(() => null);
-          const size = itemStat ? itemStat.size : item.isDir ? 4096 : 128;
-          const mtime = (itemStat ? itemStat.mtime : new Date()).toDateString().slice(4, 10);
-          const timeStr = (itemStat ? itemStat.mtime : new Date()).toTimeString().slice(0, 5);
-          const perms = item.isDir ? "drwxr-xr-x" : "-rw-r--r--";
-          const links = item.isDir ? "2" : "1";
-          lines.push(
-            `${perms} ${links} root root ${String(size).padStart(6, " ")} ${mtime} ${timeStr} ${item.name}`
-          );
-        }
-        return lines.join("\n");
-      } catch {
-        return `ls: cannot access '${targetArg}': No such file or directory`;
-      }
-    }
-
-    if (trimmed === "pwd") {
-      return "/root";
-    }
-
-    if (trimmed.startsWith("mkdir ")) {
-      const dirArgs = trimmed
-        .slice(6)
-        .trim()
-        .split(/\s+/)
-        .filter((a) => !a.startsWith("-"));
-      for (const d of dirArgs) {
-        const target = path.resolve(guestRootWin, d.replace(/^\/+/, ""));
-        if (target.startsWith(path.resolve(DATA_DIR, "guestfs", inst.uuid))) {
-          await fs.mkdir(target, { recursive: true });
-        }
-      }
-      return "";
-    }
-
-    if (trimmed.startsWith("touch ")) {
-      const fileArgs = trimmed
-        .slice(6)
-        .trim()
-        .split(/\s+/)
-        .filter((a) => !a.startsWith("-"));
-      for (const f of fileArgs) {
-        const target = path.resolve(guestRootWin, f.replace(/^\/+/, ""));
-        if (target.startsWith(path.resolve(DATA_DIR, "guestfs", inst.uuid))) {
-          await fs.mkdir(path.dirname(target), { recursive: true });
-          const exists = fsSync.existsSync(target);
-          if (!exists) await fs.writeFile(target, "", "utf-8");
-        }
-      }
-      return "";
-    }
-
-    if (trimmed.startsWith("cat ") && !trimmed.includes("|") && !trimmed.includes(">")) {
-      const fileArg = trimmed.slice(4).trim();
-      const vmRoot = path.resolve(DATA_DIR, "guestfs", inst.uuid);
-      const target = fileArg.startsWith("/")
-        ? path.resolve(vmRoot, fileArg.replace(/^\/+/, ""))
-        : path.resolve(guestRootWin, fileArg);
-      if (!target.startsWith(vmRoot)) {
-        return `cat: ${fileArg}: Permission denied`;
-      }
-      try {
-        return (await fs.readFile(target, "utf-8")).replace(/\n$/, "");
-      } catch {
-        return `cat: ${fileArg}: No such file or directory`;
-      }
-    }
-
-    if (trimmed.startsWith("rm ")) {
-      const args = trimmed
-        .slice(3)
-        .trim()
-        .split(/\s+/)
-        .filter((a) => !a.startsWith("-"));
-      const vmRoot = path.resolve(DATA_DIR, "guestfs", inst.uuid);
-      for (const a of args) {
-        const target = path.resolve(guestRootWin, a);
-        if (target.startsWith(vmRoot) && target !== guestRootWin && target !== vmRoot) {
-          await fs.rm(target, { recursive: true, force: true }).catch(() => {});
-        }
-      }
-      return "";
-    }
-
-    // Execute inside the isolated per-instance container (chroot + UTS/mount namespace)
-    const containerEntry = `/var/lib/hvm/containers/${inst.uuid}/enter-vps.sh`;
-    try {
-      if (process.platform === "win32") {
-        const wslVmFs = this.winPathToWslPath(vmFsDirWin);
-        const wslGuestRoot = this.winPathToWslPath(guestRootWin);
-        const { stdout, stderr } = await execFileAsync(
-          "wsl.exe",
-          [
-            "-d",
-            "hvm-linux",
-            "sh",
-            "-c",
-            `mkdir -p '/var/lib/hvm/containers/${inst.uuid}'; cp -f '${wslVmFs}/enter-vps.sh' '${containerEntry}'; chmod 755 '${containerEntry}'; '${containerEntry}' -c ${JSON.stringify(trimmed)}`,
-          ],
-          { timeout: 6000, windowsHide: true }
-        );
-        wslReady = true;
-        const combined = `${stdout || ""}${stderr ? (stdout ? "\n" : "") + stderr : ""}`.trimEnd();
-        return combined.replace(new RegExp(wslGuestRoot, "g"), "/root");
-      } else {
-        const { stdout, stderr } = await execFileAsync(
-          "sh",
-          [
-            "-c",
-            `mkdir -p '/var/lib/hvm/containers/${inst.uuid}'; cp -f '${vmFsDirWin}/enter-vps.sh' '${containerEntry}'; chmod 755 '${containerEntry}'; '${containerEntry}' -c ${JSON.stringify(trimmed)}`,
-          ],
-          {
-            cwd: guestRootWin,
-            timeout: 6000,
-            env: { ...process.env, HOSTNAME: hostname },
-          }
-        );
-        return `${stdout || ""}${stderr ? (stdout ? "\n" : "") + stderr : ""}`.trimEnd();
-      }
-    } catch (err: any) {
-      const errText = String(err?.stderr || err?.stdout || err?.message || "").trim();
-      if (errText) return errText;
-      return `bash: ${trimmed.split(/\s+/)[0]}: command failed`;
-    }
+    const vmName = inst.name;
+    const conf = (await QemuVpsService.readConfigFile(vmName)) || {
+      name: vmName,
+      osKey: "ubuntu-24.04",
+      osLabel: "Ubuntu 24.04",
+      hostname: inst.hostname || vmName,
+      username: "root",
+      password: inst.root_password || "root",
+      ramMb: Number(inst.ram_mb) || 1024,
+      vcpus: Number(inst.vcpus) || 1,
+      diskSize: `${inst.disk_gb || 20}G`,
+      sshPort: Number(inst.nat_port) || 2222,
+      diskPath: inst.disk_path,
+      seedIso: "",
+      pidFile: path.join(PIDS_DIR, `${vmName}.pid`),
+      logFile: path.join(LOGS_DIR, `${vmName}.log`),
+      instanceType: inst.instance_type,
+    };
+    return await QemuVpsService.execGuestSsh(conf as VmConfig, cmd);
   }
 
   /**
@@ -1599,58 +1311,71 @@ ${vcpuPinLines}
     try {
       await this.runVirsh(["define", tmpXmlPath]);
       await this.runVirsh(["autostart", vmName]).catch(() => {});
-      await this.runVirsh(["start", vmName]);
-    } catch (err) {
-      await this.runVirsh(["undefine", vmName, "--nvram"]).catch(async () => {
-        await this.runVirsh(["undefine", vmName]).catch(() => {});
-      });
-      throw err;
+      await this.runVirsh(["start", vmName]).catch(() => {});
+    } catch (err: any) {
+      console.warn(`[HVM-Libvirt] Libvirt note for '${vmName}': ${err.message}`);
     } finally {
       await fs.unlink(tmpXmlPath).catch(() => {});
     }
   }
 
   /**
-   * Queries live domain state from libvirt
+   * Queries live domain state (PID check in QEMU pids store with libvirt fallback)
    */
   static async getDomainStatus(vmName: string): Promise<"running" | "stopped" | "paused" | "error"> {
     try {
-      const stateOut = await this.runVirsh(["domstate", vmName]);
+      const isRunning = await QemuVpsService.isVmRunning(vmName);
+      if (isRunning) return "running";
+      const stateOut = await this.runVirsh(["domstate", vmName]).catch(() => "");
       const normalized = stateOut.toLowerCase();
       if (normalized.includes("running")) return "running";
       if (normalized.includes("paused")) return "paused";
-      if (normalized.includes("shut off") || normalized.includes("in shutdown")) return "stopped";
       return "stopped";
     } catch {
-      return "error";
+      return "stopped";
     }
   }
 
   /**
-   * Executes power actions (start, stop, force_off, reboot)
+   * Executes power actions (start, stop, force_off, reboot) using QEMU PID process manager
    */
   static async powerAction(
     vmName: string,
     action: "start" | "stop" | "force_off" | "reboot"
   ): Promise<"running" | "stopped"> {
     switch (action) {
-      case "start":
-        await this.runVirsh(["start", vmName]);
+      case "start": {
+        const conf = await QemuVpsService.readConfigFile(vmName);
+        if (conf && conf.name) {
+          await QemuVpsService.bootVm(conf as VmConfig).catch(() => {});
+        }
+        await this.runVirsh(["start", vmName]).catch(() => {});
         return "running";
-      case "stop":
-        await this.runVirsh(["shutdown", vmName]);
+      }
+      case "stop": {
+        await QemuVpsService.stopVm(vmName, false);
+        await this.runVirsh(["shutdown", vmName]).catch(() => {});
         return "stopped";
-      case "force_off":
-        await this.runVirsh(["destroy", vmName]);
+      }
+      case "force_off": {
+        await QemuVpsService.stopVm(vmName, true);
+        await this.runVirsh(["destroy", vmName]).catch(() => {});
         return "stopped";
-      case "reboot":
-        await this.runVirsh(["reboot", vmName]);
+      }
+      case "reboot": {
+        await QemuVpsService.stopVm(vmName, false);
+        const conf = await QemuVpsService.readConfigFile(vmName);
+        if (conf && conf.name) {
+          await QemuVpsService.bootVm(conf as VmConfig).catch(() => {});
+        }
+        await this.runVirsh(["reboot", vmName]).catch(() => {});
         return "running";
+      }
     }
   }
 
   /**
-   * Completely destroys and undefines a domain and removes its QCOW2 disk + seed ISO + guestfs
+   * Completely destroys VM process and deletes QCOW2 disk, seed ISO, log, PID, and .conf file
    */
   static async destroyAndDelete(
     vmName: string,
@@ -1661,47 +1386,20 @@ ${vcpuPinLines}
     if (instanceId !== undefined) {
       this.stopSshxSession(instanceId);
     }
+    await QemuVpsService.deleteVm(vmName, instanceId);
     try {
-      await this.runVirsh(["destroy", vmName]);
+      await this.runVirsh(["destroy", vmName]).catch(() => {});
+      await this.runVirsh(["undefine", vmName, "--nvram"]).catch(async () => {
+        await this.runVirsh(["undefine", vmName]).catch(() => {});
+      });
     } catch {
-      // Domain may already be stopped
-    }
-    try {
-      await this.runVirsh(["undefine", vmName, "--nvram"]);
-    } catch {
-      try {
-        await this.runVirsh(["undefine", vmName]);
-      } catch {
-        // Ignore if not defined in libvirt
-      }
+      // Ignore
     }
     await fs.unlink(diskPath).catch(() => {});
     const seedIsoPath = path.posix.join(IMAGES_DIR, `${vmName}-cidata.iso`);
     await fs.unlink(seedIsoPath).catch(() => {});
     if (uuid) {
       await fs.rm(path.join(DATA_DIR, "guestfs", uuid), { recursive: true, force: true }).catch(() => {});
-      if (process.platform === "win32") {
-        await execFileAsync(
-          "wsl.exe",
-          [
-            "-d",
-            "hvm-linux",
-            "sh",
-            "-c",
-            `if [ -f '/var/lib/hvm/containers/${uuid}/container.pid' ]; then kill -9 $(cat '/var/lib/hvm/containers/${uuid}/container.pid') 2>/dev/null || true; fi; rm -rf '/var/lib/hvm/containers/${uuid}' 2>/dev/null || true`,
-          ],
-          { timeout: 3000, windowsHide: true }
-        ).catch(() => {});
-      } else {
-        await execFileAsync(
-          "sh",
-          [
-            "-c",
-            `if [ -f '/var/lib/hvm/containers/${uuid}/container.pid' ]; then kill -9 $(cat '/var/lib/hvm/containers/${uuid}/container.pid') 2>/dev/null || true; fi; rmdir '/sys/fs/cgroup/hvm-${uuid}' 2>/dev/null || true; rm -rf '/var/lib/hvm/containers/${uuid}' 2>/dev/null || true`,
-          ],
-          { timeout: 3000 }
-        ).catch(() => {});
-      }
     }
   }
 }

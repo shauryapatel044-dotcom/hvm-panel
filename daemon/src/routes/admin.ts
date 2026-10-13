@@ -135,10 +135,16 @@ router.post("/instances", async (req: Request, res: Response) => {
     let assignedIpv6: string | null = null;
     let assignedNatPort: number | null = null;
 
-    if (netMode === "nat") {
+    const requestedPort = req.body.ssh_port ? Number(req.body.ssh_port) : null;
+    if (requestedPort && requestedPort >= 1024 && requestedPort <= 65535) {
+      assignedNatPort = requestedPort;
+    } else {
       assignedNatPort = await LibvirtService.allocateUnusedNatPort();
+    }
+
+    if (netMode === "nat") {
       const internalOctet = (assignedNatPort % 200) + 20;
-      assignedIp = `NAT 10.0.80.${internalOctet} (Port :${assignedNatPort})`;
+      assignedIp = `NAT 10.0.80.${internalOctet} (SSH :${assignedNatPort})`;
     } else if (netMode === "ipv6_only") {
       assignedIpv6 = trimmedIpv6 || trimmedIp || `fd00:hvm:2026::${hexBlock}/64`;
       assignedIp = assignedIpv6;
@@ -195,12 +201,12 @@ router.post("/instances", async (req: Request, res: Response) => {
         pinnedStr,
         ramMb,
         diskGb,
-        diskPath,
+        domainSpec.diskPath,
         image,
         netMode,
         assignedIp,
         assignedIpv6,
-        assignedNatPort,
+        domainSpec.natPort,
         vncPort,
         macAddress,
         initialStatus,

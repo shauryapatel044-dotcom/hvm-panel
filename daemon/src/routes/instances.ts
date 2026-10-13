@@ -6,6 +6,7 @@ import mysql from "mysql2/promise";
 import { pool, DATA_DIR } from "../db";
 import { requireAuth } from "../middleware/auth";
 import { LibvirtService, AVAILABLE_OS_IMAGES } from "../libvirt";
+import { QemuVpsService, VmConfig, CONFIGS_DIR } from "../qemu";
 
 const router = Router();
 
@@ -1103,6 +1104,234 @@ router.post("/:id/console", async (req: Request, res: Response) => {
       lines: getOrInitConsoleBuffer(inst),
       sshx_url: LibvirtService.getSshxUrl(inst),
       tailscale_url: LibvirtService.getTailscaleUrl(inst),
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================================================
+// PURE QEMU/KVM VPS ENGINE ENDPOINTS (.conf, Edit Config, Resize Disk, Performance)
+// ============================================================================
+
+// [Feature: Show VM Info] Reads the local .conf file and displays VM specs and credentials
+router.get("/:id/conf", async (req: Request, res: Response) => {
+  try {
+    const instanceId = Number(req.params.id);
+    const [rows] = await pool.query<mysql.RowDataPacket[]>(
+      "SELECT * FROM instances WHERE id = ? LIMIT 1",
+      [instanceId]
+    );
+    if (rows.length === 0) {
+      res.status(404).json({ error: "Instance not found" });
+      return;
+    }
+    const inst = rows[0];
+    if (req.user!.role !== "admin" && Number(inst.user_id) !== Number(req.user!.id)) {
+      res.status(403).json({ error: "Not authorized for this instance" });
+      return;
+    }
+
+    const conf = await QemuVpsService.readConfigFile(inst.name);
+    let rawConf = "";
+    try {
+      rawConf = await fs.readFile(path.join(CONFIGS_DIR, `${inst.name}.conf`), "utf-8");
+    } catch {
+      rawConf = `# Configuration generated from database\nVM_NAME="${inst.name}"\nHOSTNAME="${inst.hostname}"\nRAM_MB="${inst.ram_mb}"\nVCPUS="${inst.vcpus}"\nDISK_SIZE="${inst.disk_gb}G"\nSSH_PORT="${inst.nat_port || 2222}"\nPASSWORD="${inst.root_password}"\n`;
+    }
+
+    const isRunning = await QemuVpsService.isVmRunning(inst.name);
+    const pid = await QemuVpsService.getVmPid(inst.name);
+
+    res.json({
+      id: inst.id,
+      name: inst.name,
+      hostname: inst.hostname || inst.name,
+      username: conf?.username || "root",
+      password: inst.root_password,
+      ssh_port: conf?.sshPort || inst.nat_port || 2222,
+      ram_mb: conf?.ramMb || inst.ram_mb,
+      vcpus: conf?.vcpus || inst.vcpus,
+      disk_size: conf?.diskSize || `${inst.disk_gb}G`,
+      instance_type: inst.instance_type,
+      running: isRunning,
+      pid,
+      conf,
+      raw_conf: rawConf,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// [Feature: Edit VM Config] Allows user to change RAM, CPU, SSH port, or password
+// Re-generates cloud-init seed ISO if password or hostname changes
+router.patch("/:id/config", async (req: Request, res: Response) => {
+  try {
+    const instanceId = Number(req.params.id);
+    const [rows] = await pool.query<mysql.RowDataPacket[]>(
+      "SELECT * FROM instances WHERE id = ? LIMIT 1",
+      [instanceId]
+    );
+    if (rows.length === 0) {
+      res.status(404).json({ error: "Instance not found" });
+      return;
+    }
+    const inst = rows[0];
+    if (req.user!.role !== "admin" && Number(inst.user_id) !== Number(req.user!.id)) {
+      res.status(403).json({ error: "Not authorized for this instance" });
+      return;
+    }
+
+    const { ram_mb, vcpus, ssh_port, password } = req.body;
+    const existingConf = (await QemuVpsService.readConfigFile(inst.name)) || {};
+
+    const updatedRamMb = ram_mb ? Math.max(512, Number(ram_mb)) : Number(existingConf.ramMb || inst.ram_mb);
+    const updatedVcpus = vcpus ? Math.max(1, Number(vcpus)) : Number(existingConf.vcpus || inst.vcpus);
+    const updatedSshPort = ssh_port ? Number(ssh_port) : Number(existingConf.sshPort || inst.nat_port || 2222);
+    const updatedPassword = password ? String(password).trim() : String(existingConf.password || inst.root_password);
+
+    let seedIso = existingConf.seedIso || inst.seed_iso;
+
+    // If password changed, re-generate cloud-init seed ISO
+    if (password && password !== inst.root_password) {
+      seedIso = await QemuVpsService.generateCloudInitSeed(
+        inst.name,
+        inst.hostname || inst.name,
+        "root",
+        updatedPassword
+      );
+    }
+
+    const updatedConf: VmConfig = {
+      name: inst.name,
+      osKey: existingConf.osKey || "ubuntu-24.04",
+      osLabel: existingConf.osLabel || "Ubuntu 24.04",
+      hostname: existingConf.hostname || inst.hostname || inst.name,
+      username: existingConf.username || "root",
+      password: updatedPassword,
+      ramMb: updatedRamMb,
+      vcpus: updatedVcpus,
+      diskSize: existingConf.diskSize || `${inst.disk_gb}G`,
+      sshPort: updatedSshPort,
+      diskPath: existingConf.diskPath || inst.disk_path,
+      seedIso,
+      pidFile: existingConf.pidFile || path.join(DATA_DIR, "vps", "pids", `${inst.name}.pid`),
+      logFile: existingConf.logFile || path.join(DATA_DIR, "vps", "logs", `${inst.name}.log`),
+      instanceType: inst.instance_type,
+    };
+
+    await QemuVpsService.writeConfigFile(updatedConf);
+
+    await pool.query(
+      "UPDATE instances SET ram_mb = ?, vcpus = ?, nat_port = ?, root_password = ? WHERE id = ?",
+      [updatedRamMb, updatedVcpus, updatedSshPort, updatedPassword, instanceId]
+    );
+
+    const isRunning = await QemuVpsService.isVmRunning(inst.name);
+
+    res.json({
+      message: isRunning
+        ? "Configuration saved. Reboot the instance for new RAM / vCPU settings to take effect."
+        : "Configuration updated successfully.",
+      config: updatedConf,
+      reboot_required: isRunning,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// [Feature: Resize VM Disk] Expands virtual hard drive safely using qemu-img resize
+router.post("/:id/resize-disk", async (req: Request, res: Response) => {
+  try {
+    const instanceId = Number(req.params.id);
+    const [rows] = await pool.query<mysql.RowDataPacket[]>(
+      "SELECT * FROM instances WHERE id = ? LIMIT 1",
+      [instanceId]
+    );
+    if (rows.length === 0) {
+      res.status(404).json({ error: "Instance not found" });
+      return;
+    }
+    const inst = rows[0];
+    if (req.user!.role !== "admin" && Number(inst.user_id) !== Number(req.user!.id)) {
+      res.status(403).json({ error: "Not authorized for this instance" });
+      return;
+    }
+
+    const { disk_size, disk_gb } = req.body;
+    let targetSize = disk_size ? String(disk_size).trim().toUpperCase() : "";
+    let targetGb = disk_gb ? Number(disk_gb) : 0;
+
+    if (!targetSize && targetGb > 0) {
+      targetSize = `${targetGb}G`;
+    } else if (targetSize && !targetGb) {
+      const numMatch = targetSize.match(/^(\d+)[GMK]?$/);
+      if (numMatch) targetGb = parseInt(numMatch[1], 10);
+    }
+
+    if (!targetSize || !/^\d+[GMK]$/.test(targetSize) || targetGb <= Number(inst.disk_gb)) {
+      res.status(400).json({
+        error: `New disk size must be greater than current size (${inst.disk_gb}G). E.g. '30G'`,
+      });
+      return;
+    }
+
+    await QemuVpsService.resizeDisk(inst.name, targetSize);
+    await pool.query("UPDATE instances SET disk_gb = ? WHERE id = ?", [targetGb, instanceId]);
+
+    // If VM is running, attempt to grow the guest partition and ext4 filesystem online via SSH
+    const isRunning = await QemuVpsService.isVmRunning(inst.name);
+    if (isRunning) {
+      const conf = await QemuVpsService.readConfigFile(inst.name);
+      if (conf) {
+        QemuVpsService.execGuestSsh(
+          conf as VmConfig,
+          "growpart /dev/vda 1 2>/dev/null; resize2fs /dev/vda1 2>/dev/null || xfs_growfs / 2>/dev/null || true",
+          5000
+        ).catch(() => {});
+      }
+    }
+
+    res.json({
+      message: `Virtual hard drive successfully expanded to ${targetSize}!`,
+      name: inst.name,
+      disk_gb: targetGb,
+      disk_size: targetSize,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// [Feature: Show Performance] Fetches current CPU and RAM usage of the running QEMU process using ps and free
+router.get("/:id/performance", async (req: Request, res: Response) => {
+  try {
+    const instanceId = Number(req.params.id);
+    const [rows] = await pool.query<mysql.RowDataPacket[]>(
+      "SELECT * FROM instances WHERE id = ? LIMIT 1",
+      [instanceId]
+    );
+    if (rows.length === 0) {
+      res.status(404).json({ error: "Instance not found" });
+      return;
+    }
+    const inst = rows[0];
+    if (req.user!.role !== "admin" && Number(inst.user_id) !== Number(req.user!.id)) {
+      res.status(403).json({ error: "Not authorized for this instance" });
+      return;
+    }
+
+    const perf = await QemuVpsService.getVmPerformance(inst.name);
+    res.json({
+      id: inst.id,
+      name: inst.name,
+      instance_type: inst.instance_type,
+      vcpus: inst.vcpus,
+      ram_mb: inst.ram_mb,
+      disk_gb: inst.disk_gb,
+      ...perf,
     });
   } catch (err: any) {
     res.status(500).json({ error: err.message });

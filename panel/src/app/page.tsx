@@ -174,7 +174,7 @@ export default function HVMDashboard() {
   const [hostMetrics, setHostMetrics] = useState<HostRealtimeMetric | null>(null);
   const [instanceMetrics, setInstanceMetrics] = useState<Record<number, InstanceRealtimeMetric>>({});
 
-  // Admin Provision Modal State (VPS Name, Hostname, Root Password, OS Image, IPv4/IPv6/NAT Auto-Port)
+  // Admin Provision Modal State (VPS Name, Hostname, Root Password, OS Image, IPv4/IPv6/NAT Auto-Port, SSH Port)
   const [showProvisionModal, setShowProvisionModal] = useState(false);
   const [vmForm, setVmForm] = useState({
     name: "kvm-vps-01",
@@ -184,12 +184,35 @@ export default function HVMDashboard() {
     vcpus: 4,
     ram_mb: 8192,
     disk_gb: 60,
+    ssh_port: 2222,
     os_image: "ubuntu-24.04-server-cloudimg-amd64.qcow2",
     network_mode: "ipv4" as "ipv4" | "ipv6_only" | "dual_stack" | "nat" | "none",
     ip_address: "",
     ipv6_address: "",
     user_id: "",
   });
+
+  // Pure QEMU/KVM VPS Engine Modals State (Show Info, Edit Config, Resize Disk, Performance)
+  const [infoModalVm, setInfoModalVm] = useState<InstanceInfo | null>(null);
+  const [infoData, setInfoData] = useState<any | null>(null);
+  const [showPasswordInInfo, setShowPasswordInInfo] = useState<boolean>(false);
+
+  const [editModalVm, setEditModalVm] = useState<InstanceInfo | null>(null);
+  const [editForm, setEditForm] = useState({
+    ram_mb: 2048,
+    vcpus: 2,
+    ssh_port: 2222,
+    password: "",
+  });
+  const [savingEdit, setSavingEdit] = useState<boolean>(false);
+
+  const [resizeModalVm, setResizeModalVm] = useState<InstanceInfo | null>(null);
+  const [resizeDiskGb, setResizeDiskGb] = useState<number>(30);
+  const [resizingDisk, setResizingDisk] = useState<boolean>(false);
+
+  const [perfModalVm, setPerfModalVm] = useState<InstanceInfo | null>(null);
+  const [perfData, setPerfData] = useState<any | null>(null);
+  const [loadingPerf, setLoadingPerf] = useState<boolean>(false);
 
   // Live Real-Time Console / VNC / Boot Logs Modal State
   const [consoleVm, setConsoleVm] = useState<InstanceInfo | null>(null);
@@ -708,6 +731,7 @@ export default function HVMDashboard() {
           vcpus: Number(vmForm.vcpus),
           ram_mb: Number(vmForm.ram_mb),
           disk_gb: Number(vmForm.disk_gb),
+          ssh_port: Number(vmForm.ssh_port || 2222),
           user_id: vmForm.user_id ? Number(vmForm.user_id) : null,
         }),
       });
@@ -746,6 +770,84 @@ export default function HVMDashboard() {
       notify("err", err.message);
     } finally {
       setDeletingId(null);
+    }
+  };
+
+  // Pure QEMU VPS Handlers: Show Info (.conf), Edit Config, Resize Disk, Performance
+  const handleOpenInfo = async (vm: InstanceInfo) => {
+    try {
+      setInfoModalVm(vm);
+      setShowPasswordInInfo(false);
+      const data = await apiFetch(`/instances/${vm.id}/conf`);
+      setInfoData(data);
+    } catch (err: any) {
+      notify("err", err.message || "Failed to load VM configuration");
+    }
+  };
+
+  const handleOpenEdit = (vm: InstanceInfo) => {
+    setEditModalVm(vm);
+    setEditForm({
+      ram_mb: vm.ram_mb,
+      vcpus: vm.vcpus,
+      ssh_port: vm.nat_port || 2222,
+      password: vm.root_password || "",
+    });
+  };
+
+  const handleSaveEdit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!editModalVm) return;
+    try {
+      setSavingEdit(true);
+      const res = await apiFetch(`/instances/${editModalVm.id}/config`, {
+        method: "PATCH",
+        body: JSON.stringify(editForm),
+      });
+      notify("ok", res.message || "Configuration updated");
+      setEditModalVm(null);
+      await loadData();
+    } catch (err: any) {
+      notify("err", err.message);
+    } finally {
+      setSavingEdit(false);
+    }
+  };
+
+  const handleOpenResize = (vm: InstanceInfo) => {
+    setResizeModalVm(vm);
+    setResizeDiskGb(Math.max(vm.disk_gb + 10, 30));
+  };
+
+  const handleResizeDisk = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!resizeModalVm) return;
+    try {
+      setResizingDisk(true);
+      const res = await apiFetch(`/instances/${resizeModalVm.id}/resize-disk`, {
+        method: "POST",
+        body: JSON.stringify({ disk_size: `${resizeDiskGb}G`, disk_gb: resizeDiskGb }),
+      });
+      notify("ok", res.message || "Virtual hard drive expanded");
+      setResizeModalVm(null);
+      await loadData();
+    } catch (err: any) {
+      notify("err", err.message);
+    } finally {
+      setResizingDisk(false);
+    }
+  };
+
+  const handleOpenPerf = async (vm: InstanceInfo) => {
+    try {
+      setPerfModalVm(vm);
+      setLoadingPerf(true);
+      const data = await apiFetch(`/instances/${vm.id}/performance`);
+      setPerfData(data);
+    } catch (err: any) {
+      notify("err", err.message || "Failed to fetch performance telemetry");
+    } finally {
+      setLoadingPerf(false);
     }
   };
 
@@ -1679,6 +1781,57 @@ export default function HVMDashboard() {
                             >
                               <Disc className="w-3.5 h-3.5" />
                               <span>Reinstall OS</span>
+                            </motion.button>
+                          </div>
+
+                          {/* Pure QEMU VPS Engine Controls: Show Info, Edit Config, Resize Disk, Process Performance */}
+                          <div className="grid grid-cols-4 gap-1.5">
+                            <motion.button
+                              whileHover={{ scale: 1.03 }}
+                              whileTap={{ scale: 0.97 }}
+                              type="button"
+                              onClick={() => handleOpenInfo(vm)}
+                              className="glass-btn py-1 px-1.5 rounded-xl text-[11px] font-semibold flex items-center justify-center space-x-1 text-zinc-200"
+                              title="Show VM Info & .conf"
+                            >
+                              <FileText className="w-3 h-3" />
+                              <span>Info</span>
+                            </motion.button>
+
+                            <motion.button
+                              whileHover={{ scale: 1.03 }}
+                              whileTap={{ scale: 0.97 }}
+                              type="button"
+                              onClick={() => handleOpenEdit(vm)}
+                              className="glass-btn py-1 px-1.5 rounded-xl text-[11px] font-semibold flex items-center justify-center space-x-1 text-zinc-200"
+                              title="Edit VM Config (RAM, CPU, Port, Password)"
+                            >
+                              <Cpu className="w-3 h-3" />
+                              <span>Edit</span>
+                            </motion.button>
+
+                            <motion.button
+                              whileHover={{ scale: 1.03 }}
+                              whileTap={{ scale: 0.97 }}
+                              type="button"
+                              onClick={() => handleOpenResize(vm)}
+                              className="glass-btn py-1 px-1.5 rounded-xl text-[11px] font-semibold flex items-center justify-center space-x-1 text-zinc-200"
+                              title="Resize Virtual Hard Drive (qemu-img resize)"
+                            >
+                              <HardDrive className="w-3 h-3" />
+                              <span>Resize</span>
+                            </motion.button>
+
+                            <motion.button
+                              whileHover={{ scale: 1.03 }}
+                              whileTap={{ scale: 0.97 }}
+                              type="button"
+                              onClick={() => handleOpenPerf(vm)}
+                              className="glass-btn py-1 px-1.5 rounded-xl text-[11px] font-semibold flex items-center justify-center space-x-1 text-zinc-200"
+                              title="Show QEMU Process Telemetry"
+                            >
+                              <Gauge className="w-3 h-3" />
+                              <span>Perf</span>
                             </motion.button>
                           </div>
 
@@ -3161,7 +3314,7 @@ export default function HVMDashboard() {
                 </div>
               )}
 
-              <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+              <div className="grid grid-cols-2 sm:grid-cols-5 gap-3">
                 <div>
                   <label className="block text-xs text-zinc-300 mb-1">
                     {vmForm.instance_type === "VDS" ? "Pinned CPU Cores" : "Shared vCPUs"}
@@ -3198,6 +3351,18 @@ export default function HVMDashboard() {
                     value={vmForm.disk_gb}
                     onChange={(e) => setVmForm({ ...vmForm, disk_gb: Number(e.target.value) })}
                     className="w-full glass-input rounded-xl px-3 py-2 text-sm"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs text-zinc-300 mb-1">SSH Port</label>
+                  <input
+                    type="number"
+                    min={1024}
+                    max={65535}
+                    placeholder="2222"
+                    value={vmForm.ssh_port}
+                    onChange={(e) => setVmForm({ ...vmForm, ssh_port: Number(e.target.value) })}
+                    className="w-full glass-input rounded-xl px-3 py-2 text-sm font-mono"
                   />
                 </div>
                 <div>
@@ -3442,6 +3607,485 @@ export default function HVMDashboard() {
                   className="px-5 py-2 rounded-xl glass-btn-primary text-xs font-bold"
                 >
                   Done
+                </button>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* ===================================================================== */}
+      {/* MODAL 6: SHOW VM INFO & .CONF FILE                                    */}
+      {/* ===================================================================== */}
+      <AnimatePresence>
+        {infoModalVm && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 bg-black/80 backdrop-blur-md flex items-center justify-center p-4 z-50"
+          >
+            <motion.div
+              initial={{ scale: 0.94, y: 20, opacity: 0 }}
+              animate={{ scale: 1, y: 0, opacity: 1 }}
+              exit={{ scale: 0.94, y: 20, opacity: 0 }}
+              className="glass-panel rounded-3xl p-6 w-full max-w-2xl space-y-4 border border-white/25 max-h-[90vh] overflow-y-auto"
+            >
+              <div className="flex items-center justify-between border-b border-white/15 pb-3">
+                <div className="flex items-center space-x-2">
+                  <FileText className="w-4 h-4 text-white" />
+                  <h2 className="text-base font-bold text-white tracking-tight">
+                    {infoModalVm.name} — VM Info & .conf State
+                  </h2>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setInfoModalVm(null)}
+                  className="p-1.5 rounded-xl glass-btn"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+
+              {/* SSH Connection Command Bar */}
+              <div className="glass-sub rounded-2xl p-3.5 space-y-2 border border-white/20">
+                <div className="flex items-center justify-between">
+                  <span className="text-[10px] font-mono font-bold uppercase text-zinc-300">
+                    SSH Connection Command
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      copyText(
+                        `ssh-cmd-${infoModalVm.id}`,
+                        `ssh -p ${infoData?.ssh_port || infoModalVm.nat_port || 2222} root@localhost`
+                      )
+                    }
+                    className="px-2.5 py-1 rounded-lg glass-btn text-xs font-semibold flex items-center space-x-1"
+                  >
+                    {copiedId === `ssh-cmd-${infoModalVm.id}` ? (
+                      <>
+                        <Check className="w-3.5 h-3.5 text-white" />
+                        <span>Copied</span>
+                      </>
+                    ) : (
+                      <>
+                        <Copy className="w-3.5 h-3.5" />
+                        <span>Copy</span>
+                      </>
+                    )}
+                  </button>
+                </div>
+                <div className="p-2.5 rounded-xl bg-black/60 border border-white/15 font-mono text-xs text-white break-all select-all">
+                  ssh -p {infoData?.ssh_port || infoModalVm.nat_port || 2222} root@localhost
+                </div>
+              </div>
+
+              {/* Specs Grid */}
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5 text-xs">
+                <div className="glass-sub rounded-xl p-3 border border-white/10 space-y-1">
+                  <span className="text-[10px] text-zinc-400 block uppercase font-mono">Hostname</span>
+                  <span className="font-semibold text-white truncate block">
+                    {infoData?.hostname || infoModalVm.hostname || infoModalVm.name}
+                  </span>
+                </div>
+                <div className="glass-sub rounded-xl p-3 border border-white/10 space-y-1">
+                  <span className="text-[10px] text-zinc-400 block uppercase font-mono">SSH Port</span>
+                  <span className="font-mono font-semibold text-white">
+                    :{infoData?.ssh_port || infoModalVm.nat_port || 2222}
+                  </span>
+                </div>
+                <div className="glass-sub rounded-xl p-3 border border-white/10 space-y-1">
+                  <span className="text-[10px] text-zinc-400 block uppercase font-mono">RAM</span>
+                  <span className="font-semibold text-white">
+                    {infoData?.ram_mb || infoModalVm.ram_mb} MB
+                  </span>
+                </div>
+                <div className="glass-sub rounded-xl p-3 border border-white/10 space-y-1">
+                  <span className="text-[10px] text-zinc-400 block uppercase font-mono">Virtual Disk</span>
+                  <span className="font-semibold text-white">
+                    {infoData?.disk_size || `${infoModalVm.disk_gb}G`}
+                  </span>
+                </div>
+              </div>
+
+              {/* Credentials Bar */}
+              <div className="glass-sub rounded-2xl p-3.5 space-y-2 border border-white/20">
+                <div className="flex items-center justify-between">
+                  <span className="text-[10px] font-mono font-bold uppercase text-zinc-300">
+                    Root Credentials
+                  </span>
+                  <div className="flex items-center space-x-2">
+                    <button
+                      type="button"
+                      onClick={() => setShowPasswordInInfo(!showPasswordInInfo)}
+                      className="px-2.5 py-1 rounded-lg glass-btn text-xs font-semibold flex items-center space-x-1"
+                    >
+                      {showPasswordInInfo ? (
+                        <>
+                          <EyeOff className="w-3.5 h-3.5" />
+                          <span>Hide</span>
+                        </>
+                      ) : (
+                        <>
+                          <Eye className="w-3.5 h-3.5" />
+                          <span>Show</span>
+                        </>
+                      )}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        copyText(`pass-${infoModalVm.id}`, infoData?.password || infoModalVm.root_password || "")
+                      }
+                      className="px-2.5 py-1 rounded-lg glass-btn text-xs font-semibold flex items-center space-x-1"
+                    >
+                      {copiedId === `pass-${infoModalVm.id}` ? (
+                        <>
+                          <Check className="w-3.5 h-3.5 text-white" />
+                          <span>Copied</span>
+                        </>
+                      ) : (
+                        <>
+                          <Copy className="w-3.5 h-3.5" />
+                          <span>Copy Pass</span>
+                        </>
+                      )}
+                    </button>
+                  </div>
+                </div>
+                <div className="flex items-center space-x-4 text-xs font-mono">
+                  <span className="text-zinc-400">User: <b className="text-white">root</b></span>
+                  <span className="text-zinc-400">
+                    Password:{" "}
+                    <b className="text-white">
+                      {showPasswordInInfo
+                        ? infoData?.password || infoModalVm.root_password || "••••••••"
+                        : "••••••••"}
+                    </b>
+                  </span>
+                </div>
+              </div>
+
+              {/* Raw .conf File Display */}
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between">
+                  <span className="text-[10px] font-mono uppercase text-zinc-400">
+                    Local Configuration File (/var/lib/hvm-vps/configs/{infoModalVm.name}.conf):
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => copyText(`conf-${infoModalVm.id}`, infoData?.raw_conf || "")}
+                    className="text-[11px] text-zinc-300 hover:text-white underline font-mono"
+                  >
+                    Copy .conf
+                  </button>
+                </div>
+                <pre className="p-3 rounded-2xl bg-black/70 border border-white/20 font-mono text-[11px] text-zinc-300 max-h-48 overflow-y-auto whitespace-pre-wrap">
+                  {infoData?.raw_conf || "Loading configuration..."}
+                </pre>
+              </div>
+
+              <div className="flex justify-end pt-2">
+                <button
+                  type="button"
+                  onClick={() => setInfoModalVm(null)}
+                  className="px-5 py-2 rounded-xl glass-btn-primary text-xs font-bold"
+                >
+                  Close
+                </button>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* ===================================================================== */}
+      {/* MODAL 7: EDIT VM CONFIG (RAM, VCPUS, SSH PORT, PASSWORD)               */}
+      {/* ===================================================================== */}
+      <AnimatePresence>
+        {editModalVm && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 bg-black/80 backdrop-blur-md flex items-center justify-center p-4 z-50"
+          >
+            <motion.form
+              onSubmit={handleSaveEdit}
+              initial={{ scale: 0.94, y: 20, opacity: 0 }}
+              animate={{ scale: 1, y: 0, opacity: 1 }}
+              exit={{ scale: 0.94, y: 20, opacity: 0 }}
+              className="glass-panel rounded-3xl p-6 w-full max-w-lg space-y-4 border border-white/25"
+            >
+              <div className="flex items-center justify-between border-b border-white/15 pb-3">
+                <div className="flex items-center space-x-2">
+                  <Cpu className="w-4 h-4 text-white" />
+                  <h2 className="text-base font-bold text-white tracking-tight">
+                    Edit Config — {editModalVm.name}
+                  </h2>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setEditModalVm(null)}
+                  className="p-1.5 rounded-xl glass-btn"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+
+              <p className="text-xs text-zinc-400">
+                Modify RAM, CPU cores, SSH forwarding port, or root password. Changes are saved to the VM&apos;s local .conf file.
+              </p>
+
+              <div className="grid grid-cols-2 gap-3 text-xs">
+                <div>
+                  <label className="block text-zinc-300 mb-1">RAM (MB)</label>
+                  <input
+                    type="number"
+                    min={512}
+                    step={512}
+                    required
+                    value={editForm.ram_mb}
+                    onChange={(e) => setEditForm({ ...editForm, ram_mb: Number(e.target.value) })}
+                    className="w-full glass-input rounded-xl px-3 py-2 text-sm"
+                  />
+                </div>
+                <div>
+                  <label className="block text-zinc-300 mb-1">CPU Cores</label>
+                  <input
+                    type="number"
+                    min={1}
+                    max={32}
+                    required
+                    value={editForm.vcpus}
+                    onChange={(e) => setEditForm({ ...editForm, vcpus: Number(e.target.value) })}
+                    className="w-full glass-input rounded-xl px-3 py-2 text-sm"
+                  />
+                </div>
+                <div>
+                  <label className="block text-zinc-300 mb-1">SSH Forwarding Port</label>
+                  <input
+                    type="number"
+                    min={1024}
+                    max={65535}
+                    required
+                    value={editForm.ssh_port}
+                    onChange={(e) => setEditForm({ ...editForm, ssh_port: Number(e.target.value) })}
+                    className="w-full glass-input rounded-xl px-3 py-2 text-sm font-mono"
+                  />
+                </div>
+                <div>
+                  <label className="block text-zinc-300 mb-1">Root Password</label>
+                  <input
+                    type="text"
+                    required
+                    value={editForm.password}
+                    onChange={(e) => setEditForm({ ...editForm, password: e.target.value })}
+                    className="w-full glass-input rounded-xl px-3 py-2 text-sm font-mono"
+                  />
+                </div>
+              </div>
+
+              <div className="p-3 rounded-2xl bg-black/40 border border-white/10 text-[11px] text-zinc-400">
+                Note: Updating the password will automatically regenerate the Cloud-Init seed ISO. If the VM is currently running, reboot it to apply new memory and CPU limits.
+              </div>
+
+              <div className="flex justify-end space-x-2.5 pt-2">
+                <button
+                  type="button"
+                  onClick={() => setEditModalVm(null)}
+                  className="px-4 py-2 rounded-xl glass-btn text-xs"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={savingEdit}
+                  className="px-5 py-2 rounded-xl glass-btn-primary text-xs font-bold"
+                >
+                  {savingEdit ? "Saving..." : "Save Config"}
+                </button>
+              </div>
+            </motion.form>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* ===================================================================== */}
+      {/* MODAL 8: RESIZE VM DISK (QEMU-IMG RESIZE)                              */}
+      {/* ===================================================================== */}
+      <AnimatePresence>
+        {resizeModalVm && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 bg-black/80 backdrop-blur-md flex items-center justify-center p-4 z-50"
+          >
+            <motion.form
+              onSubmit={handleResizeDisk}
+              initial={{ scale: 0.94, y: 20, opacity: 0 }}
+              animate={{ scale: 1, y: 0, opacity: 1 }}
+              exit={{ scale: 0.94, y: 20, opacity: 0 }}
+              className="glass-panel rounded-3xl p-6 w-full max-w-md space-y-4 border border-white/25"
+            >
+              <div className="flex items-center justify-between border-b border-white/15 pb-3">
+                <div className="flex items-center space-x-2">
+                  <HardDrive className="w-4 h-4 text-white" />
+                  <h2 className="text-base font-bold text-white tracking-tight">
+                    Resize Virtual Disk — {resizeModalVm.name}
+                  </h2>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setResizeModalVm(null)}
+                  className="p-1.5 rounded-xl glass-btn"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+
+              <div className="space-y-2 text-xs">
+                <div className="flex items-center justify-between text-zinc-300">
+                  <span>Current Virtual Disk Size:</span>
+                  <b className="text-white font-mono">{resizeModalVm.disk_gb} GB</b>
+                </div>
+
+                <div>
+                  <label className="block text-zinc-300 mb-1">New Total Disk Size (GB)</label>
+                  <input
+                    type="number"
+                    min={resizeModalVm.disk_gb + 1}
+                    required
+                    value={resizeDiskGb}
+                    onChange={(e) => setResizeDiskGb(Number(e.target.value))}
+                    className="w-full glass-input rounded-xl px-3 py-2 text-sm font-mono"
+                  />
+                  <span className="text-[10px] text-zinc-400 mt-1 block">
+                    Expands the underlying QCOW2 virtual hard drive safely via <code>qemu-img resize</code>.
+                  </span>
+                </div>
+              </div>
+
+              <div className="flex justify-end space-x-2.5 pt-2">
+                <button
+                  type="button"
+                  onClick={() => setResizeModalVm(null)}
+                  className="px-4 py-2 rounded-xl glass-btn text-xs"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={resizingDisk || resizeDiskGb <= resizeModalVm.disk_gb}
+                  className="px-5 py-2 rounded-xl glass-btn-primary text-xs font-bold"
+                >
+                  {resizingDisk ? "Expanding..." : `Expand to ${resizeDiskGb}GB`}
+                </button>
+              </div>
+            </motion.form>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* ===================================================================== */}
+      {/* MODAL 9: QEMU PROCESS PERFORMANCE TELEMETRY                           */}
+      {/* ===================================================================== */}
+      <AnimatePresence>
+        {perfModalVm && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 bg-black/80 backdrop-blur-md flex items-center justify-center p-4 z-50"
+          >
+            <motion.div
+              initial={{ scale: 0.94, y: 20, opacity: 0 }}
+              animate={{ scale: 1, y: 0, opacity: 1 }}
+              exit={{ scale: 0.94, y: 20, opacity: 0 }}
+              className="glass-panel rounded-3xl p-6 w-full max-w-lg space-y-4 border border-white/25"
+            >
+              <div className="flex items-center justify-between border-b border-white/15 pb-3">
+                <div className="flex items-center space-x-2">
+                  <Gauge className="w-4 h-4 text-white" />
+                  <h2 className="text-base font-bold text-white tracking-tight">
+                    Performance — {perfModalVm.name}
+                  </h2>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setPerfModalVm(null)}
+                  className="p-1.5 rounded-xl glass-btn"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+
+              {loadingPerf ? (
+                <div className="p-8 text-center text-xs text-zinc-400 animate-pulse font-mono">
+                  Sampling QEMU process resource usage via ps and free...
+                </div>
+              ) : perfData ? (
+                <div className="space-y-3 text-xs">
+                  <div className="grid grid-cols-2 gap-3">
+                    <div className="glass-sub rounded-2xl p-3 border border-white/15 space-y-1">
+                      <span className="text-[10px] uppercase font-mono text-zinc-400 block">QEMU Status</span>
+                      <span className="font-bold text-white flex items-center space-x-1.5">
+                        <span className={`w-2 h-2 rounded-full ${perfData.running ? "bg-white" : "bg-zinc-600"}`} />
+                        <span>{perfData.running ? `Running (PID: ${perfData.pid})` : "Stopped"}</span>
+                      </span>
+                    </div>
+
+                    <div className="glass-sub rounded-2xl p-3 border border-white/15 space-y-1">
+                      <span className="text-[10px] uppercase font-mono text-zinc-400 block">Process CPU%</span>
+                      <span className="font-mono font-bold text-white text-base">
+                        {perfData.cpuPercent}%
+                      </span>
+                    </div>
+
+                    <div className="glass-sub rounded-2xl p-3 border border-white/15 space-y-1">
+                      <span className="text-[10px] uppercase font-mono text-zinc-400 block">Resident RAM (RSS)</span>
+                      <span className="font-mono font-bold text-white text-base">
+                        {perfData.rssMb} MB
+                      </span>
+                    </div>
+
+                    <div className="glass-sub rounded-2xl p-3 border border-white/15 space-y-1">
+                      <span className="text-[10px] uppercase font-mono text-zinc-400 block">Host Free Memory</span>
+                      <span className="font-mono font-bold text-white text-base">
+                        {perfData.hostFreeMemMb} MB
+                      </span>
+                    </div>
+                  </div>
+
+                  <div className="glass-sub rounded-2xl p-3 border border-white/10 text-[11px] text-zinc-400 font-mono space-y-1">
+                    <div>Virtual Memory Size (VSZ): {perfData.vszMb} MB</div>
+                    <div>Host Total Physical Memory: {perfData.hostTotalMemMb} MB</div>
+                    <div>Allocated VM RAM: {perfData.ram_mb} MB ({perfData.instance_type})</div>
+                  </div>
+                </div>
+              ) : (
+                <div className="p-4 text-center text-xs text-zinc-400">
+                  No performance telemetry available for this instance.
+                </div>
+              )}
+
+              <div className="flex justify-between items-center pt-2">
+                <button
+                  type="button"
+                  onClick={() => handleOpenPerf(perfModalVm)}
+                  className="px-3.5 py-1.5 rounded-xl glass-btn text-xs font-semibold flex items-center space-x-1.5"
+                >
+                  <RefreshCw className="w-3.5 h-3.5" />
+                  <span>Refresh</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setPerfModalVm(null)}
+                  className="px-5 py-2 rounded-xl glass-btn-primary text-xs font-bold"
+                >
+                  Close
                 </button>
               </div>
             </motion.div>
